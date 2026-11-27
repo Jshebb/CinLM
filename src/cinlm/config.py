@@ -53,6 +53,17 @@ class CinLMConfig:
     engram_table_sizes: Tuple[int, ...] = (32771, 32779, 32783, 32789, 32797, 32801, 32803, 32831)
     engram_conv_kernel: int = 4
 
+    # Looped Core / Adaptive Recursive Depth (Ouro / Parcae style, function-preserving at R=1)
+    # Prelude = layers[0:loop_start_layer], Core = layers[loop_start_layer:loop_end_layer], Coda = layers[loop_end_layer:]
+    loop_core_steps: int = 1
+    loop_start_layer: int = 4
+    loop_end_layer: int = 12
+    loop_max_steps: int = 4
+
+    # Multi-Token Prediction auxiliary heads (DeepSeek-V3 style, 0 = disabled, zero inference overhead)
+    mtp_num_heads: int = 0
+    mtp_loss_weight: float = 0.3
+
     # Initialization
     init_std: float = 0.02
 
@@ -60,6 +71,13 @@ class CinLMConfig:
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
         assert self.n_heads % self.n_kv_heads == 0, "n_heads must be divisible by n_kv_heads"
         assert self.global_attn_every >= 1, "global_attn_every must be >= 1"
+        assert self.loop_core_steps >= 1, "loop_core_steps must be >= 1"
+        assert self.loop_max_steps >= self.loop_core_steps, "loop_max_steps must be >= loop_core_steps"
+        if self.loop_core_steps > 1:
+            assert 0 <= self.loop_start_layer < self.loop_end_layer <= self.n_layers, (
+                f"Invalid loop core slice [{self.loop_start_layer}, {self.loop_end_layer}) for n_layers={self.n_layers}"
+            )
+        assert self.mtp_num_heads >= 0, "mtp_num_heads must be >= 0"
         if self.use_moe:
             assert 1 <= self.moe_top_k <= self.n_routed_experts
         if self.use_engram:
@@ -129,10 +147,31 @@ class CinLMConfig:
             engram_proj_active = per_layer_proj * len(self.engram_layers)
 
         final_norm = self.d_model
-        total = emb + lm_head + attn_total + ffn_total + engram_table_total + engram_proj_active + final_norm
+        loop_params = (
+            self.loop_max_steps * self.d_model + self.loop_max_steps
+            if self.loop_core_steps > 1
+            else 0
+        )
+        # Per MTP head: 3 RMSNorms (3 * d_model) + Linear(2*d_model -> d_model)
+        mtp_params = (
+            self.mtp_num_heads * (2 * self.d_model * self.d_model + 3 * self.d_model)
+            if self.mtp_num_heads > 0
+            else 0
+        )
+        total = (
+            emb
+            + lm_head
+            + attn_total
+            + ffn_total
+            + engram_table_total
+            + engram_proj_active
+            + final_norm
+            + loop_params
+            + mtp_params
+        )
         # Engram lookups are O(1) sparse row reads (not dense matmul weights), so active compute
-        # excludes the unaccessed table rows.
-        active = emb + lm_head + attn_total + ffn_active + engram_proj_active + final_norm
+        # excludes the unaccessed table rows. MTP heads are training-only (zero inference cost).
+        active = emb + lm_head + attn_total + ffn_active + engram_proj_active + final_norm + loop_params
 
         return {
             "total": total,
@@ -143,6 +182,8 @@ class CinLMConfig:
             "ffn_active": ffn_active,
             "engram_tables": engram_table_total,
             "engram_projections": engram_proj_active,
+            "loop_params": loop_params,
+            "mtp_params": mtp_params,
         }
 
 

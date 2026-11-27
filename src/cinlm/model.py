@@ -71,6 +71,7 @@ class CinLMBlock(nn.Module):
         engram_state: Optional[EngramState] = None,
         intervention: Optional[InterventionSpec] = None,
         capture_telemetry: bool = False,
+        skip_engram: bool = False,
     ) -> Tuple[
         torch.Tensor,
         Tuple[torch.Tensor, torch.Tensor],
@@ -79,9 +80,9 @@ class CinLMBlock(nn.Module):
     ]:
         layer_tel: Optional[Dict[str, Any]] = {} if capture_telemetry else None
 
-        # 1. Optional Engram conditional memory
+        # 1. Optional Engram conditional memory (skipped on recursive loop passes r >= 1)
         new_engram_state: Optional[EngramState] = engram_state
-        if self.engram is not None:
+        if self.engram is not None and not skip_engram:
             force_gate = (
                 intervention.force_engram_gate.get(self.layer_idx)
                 if intervention is not None
@@ -171,15 +172,47 @@ class CinLM(nn.Module):
         if config.tie_word_embeddings:
             self.lm_head.weight = self.tok_emb.weight
 
+        # Optional Looped Core parameters (function-preserving zero init at step 0)
+        if config.loop_core_steps > 1:
+            self.loop_step_emb: Optional[nn.Embedding] = nn.Embedding(config.loop_max_steps, config.d_model)
+            self.loop_res_scale: Optional[nn.Parameter] = nn.Parameter(torch.zeros(config.loop_max_steps))
+        else:
+            self.loop_step_emb = None
+            self.loop_res_scale = None
+
+        # Optional Multi-Token Prediction (MTP) auxiliary heads (training-only, zero inference overhead)
+        if config.mtp_num_heads > 0:
+            self.mtp_norms: Optional[nn.ModuleList] = nn.ModuleList(
+                [RMSNorm(config.d_model, eps=config.rms_norm_eps) for _ in range(config.mtp_num_heads)]
+            )
+            self.mtp_emb_norms: Optional[nn.ModuleList] = nn.ModuleList(
+                [RMSNorm(config.d_model, eps=config.rms_norm_eps) for _ in range(config.mtp_num_heads)]
+            )
+            self.mtp_projs: Optional[nn.ModuleList] = nn.ModuleList(
+                [nn.Linear(2 * config.d_model, config.d_model, bias=False) for _ in range(config.mtp_num_heads)]
+            )
+            self.mtp_out_norms: Optional[nn.ModuleList] = nn.ModuleList(
+                [RMSNorm(config.d_model, eps=config.rms_norm_eps) for _ in range(config.mtp_num_heads)]
+            )
+        else:
+            self.mtp_norms = None
+            self.mtp_emb_norms = None
+            self.mtp_projs = None
+            self.mtp_out_norms = None
+
         cos, sin = precompute_rope_cache(config.max_seq_len, config.head_dim, config.rope_theta)
         self.register_buffer("rope_cos", cos, persistent=False)
         self.register_buffer("rope_sin", sin, persistent=False)
 
         self.apply(self._init_weights)
-        # Re-zero Engram conv weights after global init so Engram starts smooth
+        # Re-zero Engram conv weights and Looped Core adapters after global init
         for layer in self.layers:
             if layer.engram is not None:
                 nn.init.zeros_(layer.engram.conv.weight)
+        if self.loop_step_emb is not None:
+            nn.init.zeros_(self.loop_step_emb.weight)
+        if self.loop_res_scale is not None:
+            nn.init.zeros_(self.loop_res_scale)
 
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
@@ -218,6 +251,7 @@ class CinLM(nn.Module):
         use_cache: bool = False,
         intervention: Optional[InterventionSpec] = None,
         capture_telemetry: bool = False,
+        num_loops: Optional[int] = None,
     ) -> Dict[str, Any]:
         bsz, seq_len = input_ids.shape
         start_pos = cache.seq_len if cache is not None else 0
@@ -225,16 +259,37 @@ class CinLM(nn.Module):
             f"Sequence length {start_pos + seq_len} exceeds max_seq_len {self.config.max_seq_len}"
         )
 
+        active_loops = self.config.loop_core_steps if num_loops is None else int(num_loops)
+        assert 1 <= active_loops <= self.config.loop_max_steps, (
+            f"num_loops={active_loops} must be in [1, {self.config.loop_max_steps}]"
+        )
+        if active_loops > 1:
+            assert self.loop_step_emb is not None and self.loop_res_scale is not None, (
+                "Looped execution requires loop_core_steps > 1 in CinLMConfig"
+            )
+
         x = self.tok_emb(input_ids)
         emb_out = x.detach() if capture_telemetry else None
 
         new_kv_caches: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = []
         new_engram_states: Dict[int, EngramState] = {}
         layer_telemetries: List[Dict[str, Any]] = []
+        loop_residuals: List[torch.Tensor] = []
+        exec_slot = 0
 
-        for idx, layer in enumerate(self.layers):
-            kv_in = cache.kv_caches[idx] if cache is not None else None
-            eng_in = cache.engram_states.get(idx) if cache is not None else None
+        def _run_block(
+            layer_idx: int,
+            hidden: torch.Tensor,
+            *,
+            skip_engram: bool,
+            record_tel: bool,
+        ) -> torch.Tensor:
+            nonlocal exec_slot
+            layer = self.layers[layer_idx]
+            kv_in = cache.kv_caches[exec_slot] if cache is not None else None
+            eng_in = None if skip_engram else (cache.engram_states.get(layer_idx) if cache is not None else None)
+            exec_slot += 1
+
             if (
                 self.gradient_checkpointing
                 and self.training
@@ -242,21 +297,22 @@ class CinLM(nn.Module):
                 and not capture_telemetry
                 and intervention is None
             ):
-                def _ckpt_fn(hidden: torch.Tensor, _layer=layer) -> torch.Tensor:
+                def _ckpt_fn(h: torch.Tensor, _layer=layer, _skip=skip_engram) -> torch.Tensor:
                     out_h, _, _, _ = _layer(
-                        hidden,
+                        h,
                         input_ids=input_ids,
                         rope_cos=self.rope_cos,
                         rope_sin=self.rope_sin,
                         start_pos=start_pos,
+                        skip_engram=_skip,
                     )
                     return out_h
 
-                x = torch.utils.checkpoint.checkpoint(_ckpt_fn, x, use_reentrant=False)
+                out_h = torch.utils.checkpoint.checkpoint(_ckpt_fn, hidden, use_reentrant=False)
                 kv_out, eng_out, layer_tel = None, None, None
             else:
-                x, kv_out, eng_out, layer_tel = layer(
-                    x,
+                out_h, kv_out, eng_out, layer_tel = layer(
+                    hidden,
                     input_ids=input_ids,
                     rope_cos=self.rope_cos,
                     rope_sin=self.rope_sin,
@@ -264,27 +320,97 @@ class CinLM(nn.Module):
                     kv_cache=kv_in,
                     engram_state=eng_in,
                     intervention=intervention,
-                    capture_telemetry=capture_telemetry,
+                    capture_telemetry=record_tel,
+                    skip_engram=skip_engram,
                 )
+
             if use_cache:
                 new_kv_caches.append(kv_out)
-                if eng_out is not None:
-                    new_engram_states[idx] = eng_out
-            if capture_telemetry and layer_tel is not None:
+                if not skip_engram and eng_out is not None:
+                    new_engram_states[layer_idx] = eng_out
+            if record_tel and layer_tel is not None:
                 layer_telemetries.append(layer_tel)
+            return out_h
+
+        if active_loops == 1:
+            for idx in range(self.config.n_layers):
+                x = _run_block(idx, x, skip_engram=False, record_tel=capture_telemetry)
+        else:
+            s_idx = self.config.loop_start_layer
+            e_idx = self.config.loop_end_layer
+
+            # 1. Prelude (runs once)
+            for idx in range(0, s_idx):
+                x = _run_block(idx, x, skip_engram=False, record_tel=capture_telemetry)
+
+            # 2. Recursive Core (r=0 exact base pass; r>=1 gated residual refinement)
+            for r in range(active_loops):
+                if r == 0:
+                    for idx in range(s_idx, e_idx):
+                        x = _run_block(idx, x, skip_engram=False, record_tel=capture_telemetry)
+                else:
+                    assert self.loop_step_emb is not None and self.loop_res_scale is not None
+                    x_base = x
+                    step_emb = self.loop_step_emb.weight[r].to(dtype=x.dtype)
+                    x_ref = x_base + step_emb
+                    for idx in range(s_idx, e_idx):
+                        x_ref = _run_block(idx, x_ref, skip_engram=True, record_tel=False)
+                    gate = torch.tanh(self.loop_res_scale[r]).to(dtype=x.dtype)
+                    x = x_base + gate * (x_ref - x_base)
+                if capture_telemetry:
+                    loop_residuals.append(x.detach())
+
+            # 3. Coda (runs once)
+            for idx in range(e_idx, self.config.n_layers):
+                x = _run_block(idx, x, skip_engram=False, record_tel=capture_telemetry)
 
         x_norm = self.final_norm(x)
         logits = self.lm_head(x_norm)
 
         loss: Optional[torch.Tensor] = None
+        ntp_loss: Optional[torch.Tensor] = None
+        mtp_loss: Optional[torch.Tensor] = None
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
+            ntp_loss = F.cross_entropy(
                 shift_logits.view(-1, self.config.vocab_size),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+            loss = ntp_loss
+
+            if (
+                self.mtp_projs is not None
+                and self.mtp_norms is not None
+                and self.mtp_emb_norms is not None
+                and self.mtp_out_norms is not None
+                and self.config.mtp_num_heads > 0
+            ):
+                mtp_terms: List[torch.Tensor] = []
+                h_prev = x_norm
+                for k_idx in range(self.config.mtp_num_heads):
+                    offset = k_idx + 1
+                    if seq_len <= offset + 1:
+                        break
+                    # Strictly causal: predict token at (t + offset + 1) from h_t and tok_{t + offset}
+                    h_cur = self.mtp_norms[k_idx](h_prev[:, : -(offset + 1), :])
+                    e_next = self.mtp_emb_norms[k_idx](self.tok_emb(input_ids[:, offset:-1]))
+                    h_fused = self.mtp_out_norms[k_idx](self.mtp_projs[k_idx](torch.cat([h_cur, e_next], dim=-1)))
+                    mtp_logits = self.lm_head(h_fused)
+                    mtp_targets = labels[:, offset + 1 :].contiguous()
+                    if (mtp_targets != -100).any():
+                        mtp_terms.append(
+                            F.cross_entropy(
+                                mtp_logits.reshape(-1, self.config.vocab_size),
+                                mtp_targets.reshape(-1),
+                                ignore_index=-100,
+                            )
+                        )
+                    h_prev = h_fused
+                if mtp_terms:
+                    mtp_loss = sum(mtp_terms) / len(mtp_terms)  # type: ignore[assignment]
+                    loss = ntp_loss + self.config.mtp_loss_weight * mtp_loss  # type: ignore[operator]
 
         out_cache = (
             CinLMCache(
@@ -299,6 +425,8 @@ class CinLM(nn.Module):
         result: Dict[str, Any] = {
             "logits": logits,
             "loss": loss,
+            "ntp_loss": ntp_loss,
+            "mtp_loss": mtp_loss,
             "cache": out_cache,
         }
         if capture_telemetry:
@@ -306,6 +434,7 @@ class CinLM(nn.Module):
                 "emb_out": emb_out,
                 "final_residual": x.detach(),
                 "layers": layer_telemetries,
+                "loop_residuals": loop_residuals,
             }
         return result
 
@@ -319,10 +448,11 @@ class CinLM(nn.Module):
         top_p: float = 1.0,
         repetition_penalty: float = 1.0,
         eos_token_id: Optional[int] = None,
+        num_loops: Optional[int] = None,
     ) -> torch.Tensor:
         """Autoregressive generation using exact hybrid KV + Engram cache."""
         self.eval()
-        out = self.forward(input_ids, use_cache=True)
+        out = self.forward(input_ids, use_cache=True, num_loops=num_loops)
         cache = out["cache"]
         logits = out["logits"][:, -1, :]
         generated = [input_ids]
@@ -364,7 +494,7 @@ class CinLM(nn.Module):
             if cache.seq_len >= self.config.max_seq_len:
                 break
 
-            out = self.forward(next_tok, cache=cache, use_cache=True)
+            out = self.forward(next_tok, cache=cache, use_cache=True, num_loops=num_loops)
             cache = out["cache"]
             logits = out["logits"][:, -1, :]
 

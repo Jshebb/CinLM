@@ -1,6 +1,7 @@
 from cinlm.config import CinLMConfig, get_preset_config
 from cinlm.model import CinLM, InterventionSpec
 from cinlm.interpretability import FrontierAuditReport, run_frontier_audit
+from cinlm.muon import MuonWithAuxAdam, build_cinlm_optimizer
 
 __all__ = [
     "CinLMConfig",
@@ -9,4 +10,6 @@ __all__ = [
     "InterventionSpec",
     "FrontierAuditReport",
     "run_frontier_audit",
+    "MuonWithAuxAdam",
+    "build_cinlm_optimizer",
 ]

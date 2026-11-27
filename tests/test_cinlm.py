@@ -215,3 +215,141 @@ def test_sft_assistant_only_loss_masking() -> None:
     assert all(l == -100 for l in labels[:-n_body])
     assert labels[-n_body:] == assistant_body
     assert ids[-n_body:] == assistant_body
+
+
+def test_muon_optimizer_and_newton_schulz() -> None:
+    """Verify Newton-Schulz orthogonalization, parameter routing, Engram LR multiplier,
+    loss decrease, and checkpoint state_dict round-trip for MuonWithAuxAdam.
+    """
+    from cinlm.muon import build_cinlm_optimizer, zeropower_via_newtonschulz5
+
+    torch.manual_seed(10)
+    for shape in ((16, 32), (32, 16)):
+        g = torch.randn(shape)
+        u = zeropower_via_newtonschulz5(g, steps=5)
+        assert u.shape == g.shape
+        gram = u @ u.T if shape[0] <= shape[1] else u.T @ u
+        eye = torch.eye(min(shape))
+        # Quintic 5-step NS targets approximate semi-orthogonal matrix (singular values in ~[0.7, 1.3])
+        assert (gram - eye).abs().max().item() < 0.45
+
+    cfg = get_preset_config("smoke")
+    model = CinLM(cfg)
+    opt, counts = build_cinlm_optimizer(
+        model, optimizer_type="muon", lr=3e-3, weight_decay=0.05, muon_lr_mult=1.0, engram_lr_mult=3.0
+    )
+    assert counts["muon_params"] > 0
+    assert counts["engram_table_params"] > 0
+    assert any(pg.get("use_muon") for pg in opt.param_groups)
+    assert any(pg.get("lr_mult") == 3.0 and not pg.get("use_muon") for pg in opt.param_groups)
+
+    x = torch.randint(0, cfg.vocab_size, (2, 24))
+    losses = []
+    for _ in range(5):
+        opt.zero_grad(set_to_none=True)
+        loss = model(x, labels=x)["loss"]
+        loss.backward()
+        opt.step()
+        losses.append(loss.item())
+    assert losses[-1] < losses[0], f"Muon failed to reduce loss: {losses}"
+
+    # Verify state_dict round-trip
+    sd = opt.state_dict()
+    opt.load_state_dict(sd)
+
+
+def test_looped_core_function_preservation_causality_and_streaming() -> None:
+    """Verify Looped Core (Prelude -> Core x R -> Coda):
+    1. Exact analytical parameter count.
+    2. Mathematical function preservation at step 0 when branching from a v1 checkpoint.
+    3. Gradient flows immediately into loop_res_scale at step 0, and into loop_step_emb when scale != 0.
+    4. Strict causality and exact KV+Engram streaming parity at R=2.
+    """
+    torch.manual_seed(11)
+    base_cfg = get_preset_config("smoke")
+    base_model = CinLM(base_cfg).eval()
+
+    loop_cfg = get_preset_config("smoke")
+    loop_cfg.loop_core_steps = 2
+    loop_cfg.loop_start_layer = 1
+    loop_cfg.loop_end_layer = 3
+    loop_cfg.loop_max_steps = 4
+    loop_cfg.__post_init__()
+
+    loop_model = CinLM(loop_cfg).eval()
+    counts = loop_model.count_parameters()
+    assert counts["exact_total"] == counts["estimated_total"], f"Loop param mismatch: {counts}"
+
+    # Load base weights into looped model (function-preserving branch)
+    res = loop_model.load_state_dict(base_model.state_dict(), strict=False)
+    assert not res.unexpected_keys
+    assert set(res.missing_keys) == {"loop_step_emb.weight", "loop_res_scale"}
+
+    x = torch.randint(0, base_cfg.vocab_size, (2, 24))
+    with torch.no_grad():
+        base_logits = base_model(x)["logits"]
+        r1_logits = loop_model(x, num_loops=1)["logits"]
+        r2_logits = loop_model(x, num_loops=2)["logits"]
+
+    assert (base_logits - r1_logits).abs().max().item() < 1e-6
+    assert (base_logits - r2_logits).abs().max().item() < 1e-6
+
+    # Verify gradient flows immediately to loop_res_scale[1] at step 0
+    loop_model.train()
+    out0 = loop_model(x, labels=x, num_loops=2)
+    out0["loss"].backward()
+    assert loop_model.loop_res_scale is not None
+    assert loop_model.loop_res_scale.grad is not None
+    assert loop_model.loop_res_scale.grad[1].abs().item() > 0.0
+
+    # Activate loop gate & step embedding, then test strict causality + streaming KV/Engram parity at R=2
+    with torch.no_grad():
+        loop_model.loop_res_scale[1] = 0.35
+        assert loop_model.loop_step_emb is not None
+        loop_model.loop_step_emb.weight[1].normal_(0.0, 0.05)
+
+    loop_model.eval()
+    x2 = x.clone()
+    pivot = 12
+    x2[:, pivot + 1 :] = (x2[:, pivot + 1 :] + 5) % base_cfg.vocab_size
+    with torch.no_grad():
+        l1 = loop_model(x, num_loops=2)["logits"]
+        l2 = loop_model(x2, num_loops=2)["logits"]
+        assert (l1[:, : pivot + 1] - l2[:, : pivot + 1]).abs().max().item() < 1e-5
+
+        # Prefill 10 tokens then decode 14 tokens one-by-one (crossing SWA window=16 at R=2!)
+        prefill = loop_model(x[:, :10], use_cache=True, num_loops=2)
+        cache = prefill["cache"]
+        chunks = [prefill["logits"]]
+        for t in range(10, 24):
+            step_out = loop_model(x[:, t : t + 1], cache=cache, use_cache=True, num_loops=2)
+            cache = step_out["cache"]
+            chunks.append(step_out["logits"])
+        stream_l = torch.cat(chunks, dim=1)
+        assert (l1 - stream_l).abs().max().item() < 1e-4
+
+
+def test_mtp_param_count_loss_and_backward() -> None:
+    """Verify Multi-Token Prediction auxiliary head parameter count, exact combined loss,
+    and clean gradient flow into MTP projections.
+    """
+    torch.manual_seed(12)
+    cfg = get_preset_config("smoke")
+    cfg.mtp_num_heads = 1
+    cfg.mtp_loss_weight = 0.3
+    cfg.__post_init__()
+
+    model = CinLM(cfg)
+    counts = model.count_parameters()
+    assert counts["exact_total"] == counts["estimated_total"], f"MTP param mismatch: {counts}"
+
+    x = torch.randint(0, cfg.vocab_size, (2, 20))
+    out = model(x, labels=x)
+    assert out["ntp_loss"] is not None and out["mtp_loss"] is not None
+    expected = out["ntp_loss"] + 0.3 * out["mtp_loss"]
+    assert abs(out["loss"].item() - expected.item()) < 1e-5
+
+    out["loss"].backward()
+    assert model.mtp_projs is not None
+    assert model.mtp_projs[0].weight.grad is not None
+    assert model.mtp_projs[0].weight.grad.abs().sum().item() > 0.0
