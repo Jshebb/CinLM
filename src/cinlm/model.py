@@ -162,6 +162,7 @@ class CinLM(nn.Module):
     def __init__(self, config: CinLMConfig) -> None:
         super().__init__()
         self.config = config
+        self.gradient_checkpointing = False
         self.tok_emb = nn.Embedding(config.vocab_size, config.d_model)
         self.layers = nn.ModuleList([CinLMBlock(config, i) for i in range(config.n_layers)])
         self.final_norm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
@@ -234,17 +235,37 @@ class CinLM(nn.Module):
         for idx, layer in enumerate(self.layers):
             kv_in = cache.kv_caches[idx] if cache is not None else None
             eng_in = cache.engram_states.get(idx) if cache is not None else None
-            x, kv_out, eng_out, layer_tel = layer(
-                x,
-                input_ids=input_ids,
-                rope_cos=self.rope_cos,
-                rope_sin=self.rope_sin,
-                start_pos=start_pos,
-                kv_cache=kv_in,
-                engram_state=eng_in,
-                intervention=intervention,
-                capture_telemetry=capture_telemetry,
-            )
+            if (
+                self.gradient_checkpointing
+                and self.training
+                and not use_cache
+                and not capture_telemetry
+                and intervention is None
+            ):
+                def _ckpt_fn(hidden: torch.Tensor, _layer=layer) -> torch.Tensor:
+                    out_h, _, _, _ = _layer(
+                        hidden,
+                        input_ids=input_ids,
+                        rope_cos=self.rope_cos,
+                        rope_sin=self.rope_sin,
+                        start_pos=start_pos,
+                    )
+                    return out_h
+
+                x = torch.utils.checkpoint.checkpoint(_ckpt_fn, x, use_reentrant=False)
+                kv_out, eng_out, layer_tel = None, None, None
+            else:
+                x, kv_out, eng_out, layer_tel = layer(
+                    x,
+                    input_ids=input_ids,
+                    rope_cos=self.rope_cos,
+                    rope_sin=self.rope_sin,
+                    start_pos=start_pos,
+                    kv_cache=kv_in,
+                    engram_state=eng_in,
+                    intervention=intervention,
+                    capture_telemetry=capture_telemetry,
+                )
             if use_cache:
                 new_kv_caches.append(kv_out)
                 if eng_out is not None:

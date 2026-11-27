@@ -164,7 +164,9 @@ def test_frontier_audit_dla_exactness_and_causal_interventions() -> None:
 
 
 def test_smoke_backward_pass() -> None:
-    """Ensure gradients flow cleanly through Embeddings, Engram, Hybrid Attn, and Sparse MoE."""
+    """Ensure gradients flow cleanly through Embeddings, Engram, Hybrid Attn, and Sparse MoE,
+    and that gradient checkpointing matches uncheckpointed forward/backward.
+    """
     torch.manual_seed(5)
     cfg = get_preset_config("smoke")
     model = CinLM(cfg)
@@ -175,3 +177,12 @@ def test_smoke_backward_pass() -> None:
     loss.backward()
     grads_present = sum(1 for p in model.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
     assert grads_present > 0
+
+    # Verify gradient checkpointing parity
+    model.zero_grad(set_to_none=True)
+    model.gradient_checkpointing = True
+    out_ckpt = model(x, labels=x)
+    assert abs(out_ckpt["loss"].item() - loss.item()) < 1e-5
+    out_ckpt["loss"].backward()
+    grads_ckpt = sum(1 for p in model.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
+    assert grads_ckpt == grads_present

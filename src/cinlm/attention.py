@@ -1,13 +1,46 @@
 from __future__ import annotations
 
 import math
-from typing import Optional, Sequence, Tuple
+from typing import Dict, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from cinlm.config import CinLMConfig
+
+try:
+    from torch.nn.attention.flex_attention import BlockMask, create_block_mask, flex_attention
+
+    _HAS_FLEX_ATTN = True
+except Exception:
+    BlockMask = None  # type: ignore[assignment,misc]
+    create_block_mask = None  # type: ignore[assignment]
+    flex_attention = None  # type: ignore[assignment]
+    _HAS_FLEX_ATTN = False
+
+_SWA_BLOCK_MASK_CACHE: Dict[Tuple[int, int, str], object] = {}
+
+
+def _get_swa_block_mask(seq_len: int, window_size: int, device: torch.device):
+    key = (seq_len, window_size, str(device))
+    cached = _SWA_BLOCK_MASK_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    def swa_mask_mod(b, h, q_idx, kv_idx):
+        return (kv_idx <= q_idx) & ((q_idx - kv_idx) < window_size)
+
+    block_mask = create_block_mask(
+        swa_mask_mod,
+        B=None,
+        H=None,
+        Q_LEN=seq_len,
+        KV_LEN=seq_len,
+        device=device,
+    )
+    _SWA_BLOCK_MASK_CACHE[key] = block_mask
+    return block_mask
 
 
 class RMSNorm(nn.Module):
@@ -130,26 +163,44 @@ class HybridAttention(nn.Module):
         # Keep full prefix in cache for exact parity; callers can trim SWA cache beyond window if desired
         new_cache = (k, v)
 
-        if self.n_rep > 1:
-            k_exp = k.repeat_interleave(self.n_rep, dim=1)
-            v_exp = v.repeat_interleave(self.n_rep, dim=1)
-        else:
-            k_exp, v_exp = k, v
+        # Fast path 1: Fused FlexAttention Triton kernel for SWA training on sm>=80 GPUs (G4/A100/L4/RTX30+)
+        # Avoids materializing the O(T^2) attention matrix!
+        use_flex_swa = (
+            _HAS_FLEX_ATTN
+            and not return_attn_weights
+            and not self.is_global
+            and self.window_size is not None
+            and kv_cache is None
+            and start_pos == 0
+            and self.dropout == 0.0
+            and q.is_cuda
+            and torch.cuda.get_device_capability(q.device)[0] >= 8
+        )
 
-        kv_len = k_exp.shape[2]
         attn_weights_out: Optional[torch.Tensor] = None
 
-        if return_attn_weights:
-            scale = 1.0 / math.sqrt(self.head_dim)
-            scores = torch.matmul(q.float(), k_exp.float().transpose(-2, -1)) * scale
-            mask = build_hybrid_causal_mask(seq_len, kv_len, start_pos, self.window_size, x.device)
-            scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-            probs = F.softmax(scores, dim=-1)
-            attn_weights_out = probs.detach()
-            y = torch.matmul(probs.to(v_exp.dtype), v_exp)
+        if use_flex_swa:
+            block_mask = _get_swa_block_mask(seq_len, self.window_size, q.device)  # type: ignore[arg-type]
+            y = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=(self.n_rep > 1))
         else:
-            if self.is_global and kv_cache is None:
-                # Fast path: PyTorch FlashAttention / SDPA causal kernel
+            if self.n_rep > 1:
+                k_exp = k.repeat_interleave(self.n_rep, dim=1)
+                v_exp = v.repeat_interleave(self.n_rep, dim=1)
+            else:
+                k_exp, v_exp = k, v
+
+            kv_len = k_exp.shape[2]
+
+            if return_attn_weights:
+                scale = 1.0 / math.sqrt(self.head_dim)
+                scores = torch.matmul(q.float(), k_exp.float().transpose(-2, -1)) * scale
+                mask = build_hybrid_causal_mask(seq_len, kv_len, start_pos, self.window_size, x.device)
+                scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+                probs = F.softmax(scores, dim=-1)
+                attn_weights_out = probs.detach()
+                y = torch.matmul(probs.to(v_exp.dtype), v_exp)
+            elif self.is_global and kv_cache is None:
+                # Fast path 2: PyTorch FlashAttention / SDPA causal kernel
                 y = F.scaled_dot_product_attention(
                     q,
                     k_exp,
@@ -159,13 +210,25 @@ class HybridAttention(nn.Module):
                 )
             else:
                 mask = build_hybrid_causal_mask(seq_len, kv_len, start_pos, self.window_size, x.device)
-                y = F.scaled_dot_product_attention(
-                    q,
-                    k_exp,
-                    v_exp,
-                    attn_mask=mask.unsqueeze(0).unsqueeze(0),
-                    dropout_p=self.dropout if self.training else 0.0,
-                )
+                # Use additive float mask on CUDA so memory-efficient SDPA avoids FP32 fallback on Turing (T4)
+                if q.is_cuda and q.dtype in (torch.float16, torch.bfloat16):
+                    attn_bias = torch.zeros((1, 1, seq_len, kv_len), dtype=q.dtype, device=q.device)
+                    attn_bias.masked_fill_(~mask.unsqueeze(0).unsqueeze(0), torch.finfo(q.dtype).min)
+                    y = F.scaled_dot_product_attention(
+                        q,
+                        k_exp,
+                        v_exp,
+                        attn_mask=attn_bias,
+                        dropout_p=self.dropout if self.training else 0.0,
+                    )
+                else:
+                    y = F.scaled_dot_product_attention(
+                        q,
+                        k_exp,
+                        v_exp,
+                        attn_mask=mask.unsqueeze(0).unsqueeze(0),
+                        dropout_p=self.dropout if self.training else 0.0,
+                    )
 
         if ablate_heads:
             # Zero out specific attention heads before o_proj for causal interpretability tests

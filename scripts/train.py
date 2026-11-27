@@ -101,6 +101,7 @@ def main() -> None:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--grad-checkpoint", action="store_true", help="Enable per-layer gradient checkpointing to save VRAM")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--out-dir", default="runs/cinlm_run")
@@ -109,8 +110,30 @@ def main() -> None:
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    use_bf16 = device.type == "cuda" and torch.cuda.is_bf16_supported()
-    autocast_dtype = torch.bfloat16 if use_bf16 else torch.float32
+
+    # Only use BF16 on native sm>=80 GPUs (A100/L4/G4/RTX30+); use FP16 + GradScaler on Turing (T4)
+    if device.type == "cuda":
+        torch.set_float32_matmul_precision("high")
+        cc_major, cc_minor = torch.cuda.get_device_capability(0)
+        gpu_name = torch.cuda.get_device_name(0)
+        if cc_major >= 8 and torch.cuda.is_bf16_supported():
+            autocast_dtype = torch.bfloat16
+            use_amp = True
+            use_scaler = False
+        else:
+            autocast_dtype = torch.float16
+            use_amp = True
+            use_scaler = True
+            print(
+                f"[CinLM] Warning: {gpu_name} (sm_{cc_major}{cc_minor}) does not support native BF16; "
+                "falling back to FP16 + GradScaler (and disabling compile if sm<80). "
+                "For full speed, switch Colab runtime to G4/A100."
+            )
+    else:
+        autocast_dtype = torch.float32
+        use_amp = False
+        use_scaler = False
+        cc_major = 0
 
     cfg = get_preset_config(args.preset)  # type: ignore[arg-type]
     if args.seq_len <= cfg.max_seq_len:
@@ -120,14 +143,16 @@ def main() -> None:
         seq_len = args.seq_len
 
     model = CinLM(cfg).to(device)
+    model.gradient_checkpointing = args.grad_checkpoint
     param_info = model.count_parameters()
-    print(f"[CinLM] preset={args.preset} device={device} bf16={use_bf16}")
+    print(f"[CinLM] preset={args.preset} device={device} dtype={autocast_dtype} grad_ckpt={args.grad_checkpoint}")
     print(
         f"[CinLM] total={param_info['exact_total']:,} "
         f"active/tok={param_info['estimated_active_per_token']:,}"
     )
 
     optimizer = build_optimizer(model, args.lr, args.weight_decay)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
     start_step = 0
     tokens_seen = 0
 
@@ -139,7 +164,8 @@ def main() -> None:
         tokens_seen = int(ckpt["tokens_seen"])
         print(f"[CinLM] Resumed from {args.resume} at step {start_step} ({tokens_seen:,} tokens)")
 
-    run_model = torch.compile(model) if args.compile and device.type == "cuda" else model
+    enable_compile = args.compile and device.type == "cuda" and cc_major >= 8
+    run_model = torch.compile(model) if enable_compile else model
 
     data_iter: Optional[object] = None
     if not args.synthetic:
@@ -173,15 +199,17 @@ def main() -> None:
                 x = x.to(device, non_blocking=True)
                 y = y.to(device, non_blocking=True)
 
-            with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_bf16):
+            with torch.amp.autocast(device_type=device.type, dtype=autocast_dtype, enabled=use_amp):
                 out = run_model(x, labels=y)
                 loss = out["loss"] / args.grad_accum
 
-            loss.backward()
+            scaler.scale(loss).backward()
             loss_accum += float(loss.detach().item())
 
+        scaler.unscale_(optimizer)
         grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip).item())
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         model.update_moe_router_biases()
         tokens_seen += tokens_per_step
 
