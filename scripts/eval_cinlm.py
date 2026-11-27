@@ -255,10 +255,82 @@ def eval_mechanistic_health(
     }
 
 
+PTBR_VAL_TEXTS: List[str] = [
+    (
+        "A Amazônia é a maior floresta tropical do mundo e desempenha um papel fundamental na regulação "
+        "do clima global. Seus rios formam a maior bacia hidrográfica do planeta, concentrando uma enorme "
+        "diversidade biológica que inclui milhões de espécies de plantas, insetos, aves e mamíferos."
+    ),
+    (
+        "Na ciência da computação, algoritmos eficientes permitem resolver problemas complexos utilizando "
+        "menos memória e menos tempo de processamento. Estruturas de dados como tabelas hash, árvores "
+        "balanceadas e grafos são ferramentas essenciais para organizar informações em larga escala."
+    ),
+    (
+        "A história da literatura brasileira atravessa diversos movimentos estéticos, do barroco e do "
+        "romantismo ao realismo de Machado de Assis e ao modernismo de 1922. Cada período refletiu as "
+        "transformações sociais, políticas e culturais do país em sua época."
+    ),
+    (
+        "O sistema solar é composto pelo Sol e por todos os corpos celestes que orbitam ao seu redor, "
+        "incluindo oito planetas, dezenas de luas, asteroides e cometas. A gravidade mantém esses objetos "
+        "em trajetórias previsíveis estudadas há séculos pela astronomia."
+    ),
+]
+
+
+@torch.no_grad()
+def eval_bits_per_byte(
+    model: CinLM,
+    tok: Tokenizer,
+    device: torch.device,
+    texts: List[str],
+) -> Dict[str, Any]:
+    """Compute tokenizer-independent Bits-Per-Byte (BPB) and token perplexity on PT-BR texts.
+
+    Formula:
+        BPB = (sum of NLL in nats across predicted tokens) / (ln(2) * total UTF-8 bytes)
+    Enables fair comparison against models with different tokenizers (e.g., Gemma-3-270M, SmolLM2).
+    """
+    total_nll_nats = 0.0
+    total_tokens = 0
+    total_bytes = 0
+    max_len = model.config.max_seq_len
+
+    for text in texts:
+        text = text.strip()
+        if not text:
+            continue
+        ids = tok.encode(text).ids[:max_len]
+        if len(ids) < 2:
+            continue
+        inp = torch.tensor([ids], dtype=torch.long, device=device)
+        logits = model(inp)["logits"][:, :-1, :].float()
+        targets = inp[:, 1:]
+        nll = F.cross_entropy(logits.reshape(-1, model.config.vocab_size), targets.reshape(-1), reduction="sum")
+        total_nll_nats += float(nll.item())
+        total_tokens += int(targets.numel())
+        # Count UTF-8 bytes covered by the predicted slice (excluding the unpredicted first token)
+        decoded_pred = tok.decode(ids[1:])
+        total_bytes += max(1, len(decoded_pred.encode("utf-8")))
+
+    mean_nll = total_nll_nats / max(1, total_tokens)
+    bpb = total_nll_nats / (math.log(2.0) * max(1, total_bytes))
+    return {
+        "n_docs": len(texts),
+        "total_tokens": total_tokens,
+        "total_utf8_bytes": total_bytes,
+        "mean_ce_nats": round(mean_nll, 5),
+        "token_perplexity": round(math.exp(min(mean_nll, 20.0)), 4),
+        "bits_per_byte": round(bpb, 5),
+    }
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate CinLM checkpoint (PT-BR + Recall + Frontier Audit)")
+    parser = argparse.ArgumentParser(description="Evaluate CinLM checkpoint (PT-BR + BPB + Recall + Frontier Audit)")
     parser.add_argument("--checkpoint", default=None, help="Path to CinLM .pt checkpoint")
     parser.add_argument("--tokenizer", required=True, help="Path to tokenizer.json")
+    parser.add_argument("--val-file", default=None, help="Optional UTF-8 text/jsonl validation file for BPB")
     parser.add_argument("--preset", default="smoke", help="Fallback preset if no checkpoint provided")
     parser.add_argument("--max-new-tokens", type=int, default=80)
     parser.add_argument("--out", default="eval_report.json")
@@ -268,10 +340,31 @@ def main() -> None:
     tok = Tokenizer.from_file(args.tokenizer)
     model, meta = load_checkpoint(args.checkpoint, args.preset, device)
 
+    if args.val_file:
+        raw = Path(args.val_file).read_text(encoding="utf-8").splitlines()
+        val_texts = []
+        for line in raw:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("{"):
+                try:
+                    val_texts.append(str(json.loads(line).get("text", "")))
+                    continue
+                except Exception:
+                    pass
+            val_texts.append(line)
+    else:
+        val_texts = PTBR_VAL_TEXTS
+
     print(f"[CinLM Eval] model={model.config.name} step={meta['step']} tokens={meta['tokens_seen']:,}")
+    bpb_metrics = eval_bits_per_byte(model, tok, device, val_texts)
     gens = eval_ptbr_generation(model, tok, device, max_new_tokens=args.max_new_tokens)
     recall = eval_associative_recall(model, tok, device)
     mech = eval_mechanistic_health(model, tok, device)
+
+    print("\n=== Validação Independente PT-BR (BPB) ===")
+    print(json.dumps(bpb_metrics, ensure_ascii=False, indent=2))
 
     print("\n=== Amostras PT-BR (sampled) ===")
     for g in gens:
@@ -287,6 +380,7 @@ def main() -> None:
 
     report = {
         "meta": meta,
+        "validation_bpb": bpb_metrics,
         "generations": gens,
         "associative_recall": recall,
         "mechanistic": mech,

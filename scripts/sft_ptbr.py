@@ -81,6 +81,11 @@ def main() -> None:
     parser.add_argument("--save-every", type=int, default=250)
     parser.add_argument("--keep-checkpoints", type=int, default=2)
     parser.add_argument("--auto-resume", action="store_true")
+    parser.add_argument(
+        "--include-canarim",
+        action="store_true",
+        help="Mix 30% Canarim-Instruct-PTBR (CC-BY-NC-4.0). Off by default to keep 100% Apache 2.0.",
+    )
     parser.add_argument("--out-dir", default="runs/cinlm_sft_ptbr")
     args = parser.parse_args()
 
@@ -133,7 +138,12 @@ def main() -> None:
             f"(pretrain step={int(ckpt.get('step', 0)) + 1}, pretrain tokens={int(ckpt.get('tokens_seen', 0)):,})"
         )
 
-    ds = PackedSFTStreamDataset(args.tokenizer, seq_len=args.seq_len, seed=args.seed + start_step)
+    ds = PackedSFTStreamDataset(
+        args.tokenizer,
+        seq_len=args.seq_len,
+        seed=args.seed + start_step,
+        include_canarim=args.include_canarim,
+    )
     n_workers = min(4, max(2, (os.cpu_count() or 2) // 2)) if device.type == "cuda" else 0
     loader_kwargs = (
         {"num_workers": n_workers, "prefetch_factor": 4, "pin_memory": True, "persistent_workers": True}

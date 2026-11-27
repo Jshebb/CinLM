@@ -254,8 +254,11 @@ def normalize_sft_row(row: Dict) -> Optional[List[Dict[str, str]]]:
 
 
 class PackedSFTStreamDataset(IterableDataset):
-    """Streaming PT-BR SFT dataset mixing GigaVerbo-v2-SFT + Canarim-Instruct-PTBR
-    with strict assistant-only loss masking and packing into `seq_len` chunks.
+    """Streaming PT-BR SFT dataset with strict assistant-only loss masking.
+
+    Defaults to 100% Apache 2.0 (`Polygl0t/gigaverbo-v2-sft`, ~4.1M PT-BR conversations)
+    so the resulting CinLM-Chat weights can be published cleanly under Apache 2.0.
+    Pass `include_canarim=True` to mix 30% `dominguesm/Canarim-Instruct-PTBR-Dataset` (CC-BY-NC-4.0).
     """
 
     def __init__(
@@ -264,16 +267,20 @@ class PackedSFTStreamDataset(IterableDataset):
         seq_len: int = 2048,
         seed: int = 42,
         shuffle_buffer: int = 1000,
+        include_canarim: bool = False,
     ) -> None:
         super().__init__()
         self.tokenizer_path = str(tokenizer_path)
         self.seq_len = seq_len
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
-        self.sources = (
-            ("Polygl0t/gigaverbo-v2-sft", None, "train", 0.70),
-            ("dominguesm/Canarim-Instruct-PTBR-Dataset", None, "train", 0.30),
-        )
+        if include_canarim:
+            self.sources = (
+                ("Polygl0t/gigaverbo-v2-sft", None, "train", 0.70),
+                ("dominguesm/Canarim-Instruct-PTBR-Dataset", None, "train", 0.30),
+            )
+        else:
+            self.sources = (("Polygl0t/gigaverbo-v2-sft", None, "train", 1.0),)
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
         import random
