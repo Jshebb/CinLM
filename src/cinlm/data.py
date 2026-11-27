@@ -107,7 +107,7 @@ class PackedTokenStreamDataset(IterableDataset):
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
 
-    def _open_streams(self) -> List[Tuple[StreamSource, Iterator[Dict]]]:
+    def _open_streams(self, seed_offset: int = 0) -> List[Tuple[StreamSource, Iterator[Dict]]]:
         from datasets import load_dataset
 
         opened = []
@@ -119,7 +119,7 @@ class PackedTokenStreamDataset(IterableDataset):
                 streaming=True,
             )
             if self.shuffle_buffer > 0:
-                ds = ds.shuffle(seed=self.seed + idx, buffer_size=self.shuffle_buffer)
+                ds = ds.shuffle(seed=self.seed + seed_offset + idx, buffer_size=self.shuffle_buffer)
             opened.append((src, iter(ds)))
         return opened
 
@@ -127,12 +127,15 @@ class PackedTokenStreamDataset(IterableDataset):
         import random
         from tokenizers import Tokenizer
 
+        worker_info = torch.utils.data.get_worker_info()
+        worker_offset = worker_info.id * 1009 if worker_info is not None else 0
+
         tok = Tokenizer.from_file(self.tokenizer_path)
         eos_id = tok.token_to_id("<|eos|>")
         assert eos_id is not None, "Tokenizer missing <|eos|> token"
 
-        rng = random.Random(self.seed)
-        streams = self._open_streams()
+        rng = random.Random(self.seed + worker_offset)
+        streams = self._open_streams(seed_offset=worker_offset)
         weights = [s.weight for s, _ in streams]
         buf: List[int] = []
 

@@ -20,6 +20,16 @@ except Exception:
     _HAS_FLEX_ATTN = False
 
 _SWA_BLOCK_MASK_CACHE: Dict[Tuple[int, int, str], object] = {}
+_COMPILED_FLEX_ATTN = None
+
+
+def _get_compiled_flex_attention():
+    global _COMPILED_FLEX_ATTN
+    if _COMPILED_FLEX_ATTN is None:
+        # Compiling flex_attention directly guarantees a fused Triton SWA kernel
+        # even when gradient checkpointing or MoE routing prevents whole-model compilation.
+        _COMPILED_FLEX_ATTN = torch.compile(flex_attention)
+    return _COMPILED_FLEX_ATTN
 
 
 def _get_swa_block_mask(seq_len: int, window_size: int, device: torch.device):
@@ -181,7 +191,8 @@ class HybridAttention(nn.Module):
 
         if use_flex_swa:
             block_mask = _get_swa_block_mask(seq_len, self.window_size, q.device)  # type: ignore[arg-type]
-            y = flex_attention(q, k, v, block_mask=block_mask, enable_gqa=(self.n_rep > 1))
+            compiled_flex = _get_compiled_flex_attention()
+            y = compiled_flex(q, k, v, block_mask=block_mask, enable_gqa=(self.n_rep > 1))
         else:
             if self.n_rep > 1:
                 k_exp = k.repeat_interleave(self.n_rep, dim=1)

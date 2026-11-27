@@ -118,30 +118,35 @@ class SparseReLU2MoE(nn.Module):
             counts = torch.bincount(topk_idx.reshape(-1), minlength=self.n_experts).float()
             self._last_expert_counts.copy_(counts)
 
-        # 3. True sparse token dispatch per expert
+        # 3. True sparse token dispatch per expert (single argsort + contiguous slices, 1 sync/layer)
         routed_out = torch.zeros_like(x_flat)
         ablate_set = set(ablate_experts) if ablate_experts else set()
 
-        # Sort assignments by expert_id for contiguous indexing
         flat_expert_ids = topk_idx.reshape(-1)  # (N * K,)
         flat_token_ids = torch.arange(n_tokens, device=x.device).repeat_interleave(self.top_k)
         flat_weights = topk_weights.reshape(-1)  # (N * K,)
 
+        sort_idx = torch.argsort(flat_expert_ids, stable=False)
+        sorted_tok_ids = flat_token_ids.index_select(0, sort_idx)
+        sorted_weights = flat_weights.index_select(0, sort_idx).unsqueeze(-1)
+        sorted_x = x_flat.index_select(0, sorted_tok_ids)
+
+        counts_list = counts.to(dtype=torch.long).tolist()
         routed_zero_sum = torch.zeros(n_tokens, device=x.device, dtype=torch.float32) if return_telemetry else None
 
-        for exp_id in range(self.n_experts):
-            if exp_id in ablate_set:
+        offset = 0
+        for exp_id, cnt in enumerate(counts_list):
+            if cnt == 0:
                 continue
-            mask = flat_expert_ids == exp_id
-            if not mask.any():
-                continue
-            tok_ids = flat_token_ids[mask]
-            weights = flat_weights[mask].unsqueeze(-1)
-            exp_in = x_flat.index_select(0, tok_ids)
-            exp_out, exp_stats = self.experts[exp_id](exp_in, return_stats=return_telemetry)
-            routed_out.index_add_(0, tok_ids, exp_out * weights)
-            if return_telemetry and exp_stats is not None and routed_zero_sum is not None:
-                routed_zero_sum.index_add_(0, tok_ids, exp_stats["relu2_zero_frac"] / self.top_k)
+            end = offset + cnt
+            if exp_id not in ablate_set:
+                exp_in = sorted_x[offset:end]
+                exp_out, exp_stats = self.experts[exp_id](exp_in, return_stats=return_telemetry)
+                tok_ids = sorted_tok_ids[offset:end]
+                routed_out.index_add_(0, tok_ids, exp_out * sorted_weights[offset:end])
+                if return_telemetry and exp_stats is not None and routed_zero_sum is not None:
+                    routed_zero_sum.index_add_(0, tok_ids, exp_stats["relu2_zero_frac"] / self.top_k)
+            offset = end
 
         out = (shared_out + routed_out).view(bsz, seq_len, d_model)
 
