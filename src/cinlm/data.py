@@ -276,11 +276,22 @@ class PackedSFTStreamDataset(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
         if include_canarim:
             self.sources = (
-                ("Polygl0t/gigaverbo-v2-sft", None, "train", 0.70),
+                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.35),
+                ("Polygl0t/gigaverbo-v2-sft", "retrieval", "train", 0.20),
+                ("Polygl0t/gigaverbo-v2-sft", "summarization", "train", 0.08),
+                ("Polygl0t/gigaverbo-v2-sft", "reasoning", "train", 0.07),
                 ("dominguesm/Canarim-Instruct-PTBR-Dataset", None, "train", 0.30),
             )
         else:
-            self.sources = (("Polygl0t/gigaverbo-v2-sft", None, "train", 1.0),)
+            # 100% Apache 2.0 balanced PT-BR conversational + grounded retrieval mix
+            self.sources = (
+                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.45),
+                ("Polygl0t/gigaverbo-v2-sft", "retrieval", "train", 0.25),
+                ("Polygl0t/gigaverbo-v2-sft", "summarization", "train", 0.10),
+                ("Polygl0t/gigaverbo-v2-sft", "reasoning", "train", 0.10),
+                ("Polygl0t/gigaverbo-v2-sft", "system_prompts", "train", 0.05),
+                ("Polygl0t/gigaverbo-v2-sft", "rewriting", "train", 0.05),
+            )
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
         import random
