@@ -186,7 +186,7 @@ def main() -> None:
         assert args.tokenizer is not None, "Provide --tokenizer path or pass --synthetic"
         # Offset shuffle seed on resume so streamed documents don't repeat from scratch
         ds = PackedTokenStreamDataset(args.tokenizer, seq_len=seq_len, seed=args.seed + start_step)
-        n_workers = 2 if device.type == "cuda" else 0
+        n_workers = min(4, max(2, (os.cpu_count() or 2) // 2)) if device.type == "cuda" else 0
         loader_kwargs = (
             {"num_workers": n_workers, "prefetch_factor": 4, "pin_memory": True, "persistent_workers": True}
             if n_workers > 0
