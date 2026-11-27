@@ -28,7 +28,11 @@ import torch
 from torch.utils.data import DataLoader
 
 from cinlm.config import CinLMConfig, get_preset_config
-from cinlm.data import PackedTokenStreamDataset
+from cinlm.data import (
+    DEFAULT_PTBR_PRETRAIN_SOURCES,
+    HIGH_DENSITY_PTBR_PRETRAIN_SOURCES,
+    PackedTokenStreamDataset,
+)
 from cinlm.model import CinLM
 from cinlm.muon import build_cinlm_optimizer
 
@@ -89,9 +93,16 @@ def main() -> None:
             "dense_hybrid_100m",
             "hybrid_engram_100m",
             "full_260m_a100m",
+            "full_1b_a200m",
         ],
     )
     parser.add_argument("--tokenizer", default=None, help="Path to tokenizer.json (omit for --synthetic smoke)")
+    parser.add_argument(
+        "--data-mix",
+        default="default",
+        choices=["default", "high_density"],
+        help="PT-BR pretrain mixture: default (70/15/15) or high_density (55/30/15 synth-boosted)",
+    )
     parser.add_argument("--synthetic", action="store_true", help="Run on synthetic random tokens (speed/smoke check)")
     parser.add_argument("--seq-len", type=int, default=2048)
     parser.add_argument("--batch-size", type=int, default=8)
@@ -117,8 +128,8 @@ def main() -> None:
 
     # Experimental CinLM v2 architecture extensions (default OFF -> exact v1 compatibility)
     parser.add_argument("--loop-core-steps", type=int, default=1, help="Recursive Core loop depth (1 = off, 2/4 = Looped CinLM)")
-    parser.add_argument("--loop-start-layer", type=int, default=4)
-    parser.add_argument("--loop-end-layer", type=int, default=12)
+    parser.add_argument("--loop-start-layer", type=int, default=None)
+    parser.add_argument("--loop-end-layer", type=int, default=None)
     parser.add_argument("--loop-max-steps", type=int, default=4)
     parser.add_argument("--loop-train-mode", default="random", choices=["fixed", "random"])
     parser.add_argument("--mtp-heads", type=int, default=0, help="Multi-Token Prediction auxiliary heads (0 = off, 1 = t+2)")
@@ -180,8 +191,10 @@ def main() -> None:
         cfg = _cfg_from_dict(init_ckpt["config"])
         # Apply requested branch architecture extensions (function-preserving at step 0)
         cfg.loop_core_steps = args.loop_core_steps
-        cfg.loop_start_layer = args.loop_start_layer
-        cfg.loop_end_layer = args.loop_end_layer
+        if args.loop_start_layer is not None:
+            cfg.loop_start_layer = args.loop_start_layer
+        if args.loop_end_layer is not None:
+            cfg.loop_end_layer = args.loop_end_layer
         cfg.loop_max_steps = max(args.loop_max_steps, args.loop_core_steps)
         cfg.mtp_num_heads = args.mtp_heads
         cfg.mtp_loss_weight = args.mtp_weight
@@ -189,8 +202,10 @@ def main() -> None:
     else:
         cfg = get_preset_config(args.preset)  # type: ignore[arg-type]
         cfg.loop_core_steps = args.loop_core_steps
-        cfg.loop_start_layer = args.loop_start_layer
-        cfg.loop_end_layer = args.loop_end_layer
+        if args.loop_start_layer is not None:
+            cfg.loop_start_layer = args.loop_start_layer
+        if args.loop_end_layer is not None:
+            cfg.loop_end_layer = args.loop_end_layer
         cfg.loop_max_steps = max(args.loop_max_steps, args.loop_core_steps)
         cfg.mtp_num_heads = args.mtp_heads
         cfg.mtp_loss_weight = args.mtp_weight
@@ -263,7 +278,14 @@ def main() -> None:
     data_iter: Optional[object] = None
     if not args.synthetic:
         assert args.tokenizer is not None, "Provide --tokenizer path or pass --synthetic"
-        ds = PackedTokenStreamDataset(args.tokenizer, seq_len=seq_len, seed=base_data_seed + start_step)
+        sources = (
+            HIGH_DENSITY_PTBR_PRETRAIN_SOURCES
+            if args.data_mix == "high_density"
+            else DEFAULT_PTBR_PRETRAIN_SOURCES
+        )
+        ds = PackedTokenStreamDataset(
+            args.tokenizer, sources=sources, seq_len=seq_len, seed=base_data_seed + start_step
+        )
         n_workers = min(4, max(2, (os.cpu_count() or 2) // 2)) if device.type == "cuda" else 0
         loader_kwargs = (
             {"num_workers": n_workers, "prefetch_factor": 4, "pin_memory": True, "persistent_workers": True}

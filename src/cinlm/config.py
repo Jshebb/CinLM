@@ -193,11 +193,12 @@ PresetName = Literal[
     "dense_hybrid_100m",
     "hybrid_engram_100m",
     "full_260m_a100m",
+    "full_1b_a200m",
 ]
 
 
 def get_preset_config(preset: PresetName) -> CinLMConfig:
-    """Return scientifically matched presets for the CinLM ablation ladder."""
+    """Return scientifically matched presets for the CinLM ablation ladder & 1B flagship."""
     if preset == "smoke":
         return CinLMConfig(
             name="cinlm-smoke",
@@ -251,5 +252,31 @@ def get_preset_config(preset: PresetName) -> CinLMConfig:
             swa_window_size=256,
             use_moe=True,
             use_engram=True,
+        )
+    if preset == "full_1b_a200m":
+        return CinLMConfig(
+            name="cinlm-1b-a200m",
+            vocab_size=32768,
+            d_model=768,
+            n_layers=20,
+            n_heads=12,
+            n_kv_heads=2,
+            max_seq_len=2048,
+            global_attn_every=4,
+            swa_window_size=256,
+            use_qk_norm=True,
+            use_moe=True,
+            d_shared_expert=1280,
+            d_routed_expert=1792,
+            n_routed_experts=16,
+            moe_top_k=2,
+            use_engram=True,
+            engram_layers=(1, 7),
+            engram_ngram_orders=(2, 3),
+            engram_heads_per_order=4,
+            engram_head_dim=64,
+            engram_table_sizes=(32771, 32779, 32783, 32789, 32797, 32801, 32803, 32831),
+            loop_start_layer=4,
+            loop_end_layer=16,
         )
     raise ValueError(f"Unknown preset: {preset}")

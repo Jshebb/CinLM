@@ -353,3 +353,41 @@ def test_mtp_param_count_loss_and_backward() -> None:
     assert model.mtp_projs is not None
     assert model.mtp_projs[0].weight.grad is not None
     assert model.mtp_projs[0].weight.grad.abs().sum().item() > 0.0
+
+
+def test_full_1b_a200m_preset_and_simpo_loss() -> None:
+    """Verify CinLM-1B-A200M analytical count (~1.01B total / ~204M active) and SimPO loss step."""
+    import importlib.util
+    from pathlib import Path
+
+    cfg_1b = get_preset_config("full_1b_a200m")
+    est = cfg_1b.estimate_parameters()
+    assert 1_000_000_000 <= est["total"] <= 1_020_000_000, f"Unexpected 1B total: {est['total']:,}"
+    assert 195_000_000 <= est["active_per_token"] <= 215_000_000, f"Unexpected 1B active: {est['active_per_token']:,}"
+    assert cfg_1b.n_layers == 20 and cfg_1b.global_attn_every == 4 and cfg_1b.use_engram and cfg_1b.use_moe
+
+    # Verify SimPO loss decreases and increases chosen-vs-rejected reward margin on smoke model
+    simpo_path = Path(__file__).resolve().parent.parent / "scripts" / "simpo_ptbr.py"
+    spec = importlib.util.spec_from_file_location("simpo_ptbr", simpo_path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    torch.manual_seed(13)
+    smoke = CinLM(get_preset_config("smoke"))
+    opt = torch.optim.AdamW(smoke.parameters(), lr=5e-3)
+
+    prompt = [1, 2, 3, 4]
+    chosen_ids = torch.tensor([prompt + [10, 11, 12, 13]])
+    chosen_lbl = torch.tensor([[-100, -100, -100, -100, 10, 11, 12, 13]])
+    rejected_ids = torch.tensor([prompt + [20, 20, 20, 20]])
+    rejected_lbl = torch.tensor([[-100, -100, -100, -100, 20, 20, 20, 20]])
+
+    _, m0 = mod.compute_simpo_loss(smoke, chosen_ids, chosen_lbl, rejected_ids, rejected_lbl)
+    for _ in range(5):
+        opt.zero_grad(set_to_none=True)
+        loss, m_last = mod.compute_simpo_loss(smoke, chosen_ids, chosen_lbl, rejected_ids, rejected_lbl)
+        loss.backward()
+        opt.step()
+    assert m_last["reward_margin"] > m0["reward_margin"]
+    assert m_last["pref_acc"] == 1.0

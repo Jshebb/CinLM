@@ -84,6 +84,84 @@ DEFAULT_PTBR_PRETRAIN_SOURCES: Tuple[StreamSource, ...] = (
     ),
 )
 
+# High-density constrained-pretraining mix (doubles clean synthetic PT-BR educational/reasoning share)
+HIGH_DENSITY_PTBR_PRETRAIN_SOURCES: Tuple[StreamSource, ...] = (
+    StreamSource(
+        dataset_name="Polygl0t/gigaverbo-v2",
+        subset="edu_high",
+        split="train",
+        text_field="text",
+        weight=0.55,
+    ),
+    StreamSource(
+        dataset_name="Polygl0t/gigaverbo-v2-synth",
+        subset=None,
+        split="train",
+        text_field="text",
+        weight=0.30,
+    ),
+    StreamSource(
+        dataset_name="HuggingFaceFW/fineweb-edu",
+        subset="sample-10BT",
+        split="train",
+        text_field="text",
+        weight=0.15,
+    ),
+)
+
+CINLM_IDENTITY_EXAMPLES: Tuple[List[Dict[str, str]], ...] = (
+    [
+        {"role": "user", "content": "Olá! Quem é você?"},
+        {
+            "role": "assistant",
+            "content": "Olá! Eu sou o CinLM, um modelo de linguagem aberto desenvolvido em português do Brasil. Posso ajudar a responder perguntas, resumir textos, explicar conceitos e analisar informações fornecidas no contexto.",
+        },
+    ],
+    [
+        {"role": "user", "content": "Quem é você e o que você consegue fazer?"},
+        {
+            "role": "assistant",
+            "content": "Sou o CinLM, um assistente de IA em português do Brasil baseado em uma arquitetura híbrida eficiente (Atenção Híbrida + Memória Engram + MoE esparso). Consigo explicar temas técnicos e gerais, extrair informações de textos, resumir conteúdos e ajudar em estudos e escrita.",
+        },
+    ],
+    [
+        {"role": "user", "content": "Qual é o seu nome?"},
+        {"role": "assistant", "content": "Meu nome é CinLM. Como posso ajudar você hoje?"},
+    ],
+    [
+        {"role": "user", "content": "Oi, tudo bem?"},
+        {"role": "assistant", "content": "Oi! Tudo ótimo por aqui. Sou o CinLM — em que posso te ajudar hoje?"},
+    ],
+    [
+        {"role": "user", "content": "Você é o ChatGPT ou o Gemini?"},
+        {
+            "role": "assistant",
+            "content": "Não, eu sou o CinLM, um modelo de linguagem pequeno e aberto treinado do zero com foco em português do Brasil e eficiência computacional.",
+        },
+    ],
+    [
+        {"role": "user", "content": "Como você funciona por dentro?"},
+        {
+            "role": "assistant",
+            "content": "Minha arquitetura combina camadas de Sliding Window Attention e Global Attention, tabelas de memória condicional Engram para padrões locais e camadas Mixture-of-Experts (MoE) esparsas com ativação ReLU². Isso permite manter alto desempenho ativando apenas uma fração dos parâmetros por token.",
+        },
+    ],
+    [
+        {"role": "user", "content": "Você sabe tudo ou pode cometer erros?"},
+        {
+            "role": "assistant",
+            "content": "Como qualquer modelo de linguagem compacto, posso cometer erros ou não conhecer fatos muito recentes. Quando você fornece um texto de referência, busco responder com base direta no que está escrito.",
+        },
+    ],
+    [
+        {"role": "user", "content": "Fale um pouco sobre você em uma frase."},
+        {
+            "role": "assistant",
+            "content": "Sou o CinLM, um assistente aberto e eficiente em português do Brasil projetado para conversar, resumir e responder com clareza.",
+        },
+    ],
+)
+
 
 class PackedTokenStreamDataset(IterableDataset):
     """Streaming token-packing dataset for Colab G4 without requiring terabytes of disk.
@@ -268,29 +346,34 @@ class PackedSFTStreamDataset(IterableDataset):
         seed: int = 42,
         shuffle_buffer: int = 1000,
         include_canarim: bool = False,
+        identity_prob: float = 0.025,
     ) -> None:
         super().__init__()
         self.tokenizer_path = str(tokenizer_path)
         self.seq_len = seq_len
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
+        self.identity_prob = identity_prob
         if include_canarim:
             self.sources = (
-                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.35),
+                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.30),
                 ("Polygl0t/gigaverbo-v2-sft", "retrieval", "train", 0.20),
                 ("Polygl0t/gigaverbo-v2-sft", "summarization", "train", 0.08),
                 ("Polygl0t/gigaverbo-v2-sft", "reasoning", "train", 0.07),
+                ("Polygl0t/gigaverbo-v2-sft", "math_cot", "train", 0.05),
                 ("dominguesm/Canarim-Instruct-PTBR-Dataset", None, "train", 0.30),
             )
         else:
-            # 100% Apache 2.0 balanced PT-BR conversational + grounded retrieval mix
+            # 100% Apache 2.0 multi-skill PT-BR SFT mix
             self.sources = (
-                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.45),
-                ("Polygl0t/gigaverbo-v2-sft", "retrieval", "train", 0.25),
+                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.38),
+                ("Polygl0t/gigaverbo-v2-sft", "retrieval", "train", 0.24),
                 ("Polygl0t/gigaverbo-v2-sft", "summarization", "train", 0.10),
                 ("Polygl0t/gigaverbo-v2-sft", "reasoning", "train", 0.10),
-                ("Polygl0t/gigaverbo-v2-sft", "system_prompts", "train", 0.05),
-                ("Polygl0t/gigaverbo-v2-sft", "rewriting", "train", 0.05),
+                ("Polygl0t/gigaverbo-v2-sft", "math_cot", "train", 0.05),
+                ("Polygl0t/gigaverbo-v2-sft", "code", "train", 0.05),
+                ("Polygl0t/gigaverbo-v2-sft", "system_prompts", "train", 0.04),
+                ("Polygl0t/gigaverbo-v2-sft", "rewriting", "train", 0.04),
             )
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
@@ -307,28 +390,38 @@ class PackedSFTStreamDataset(IterableDataset):
         rng = random.Random(self.seed + worker_offset)
         streams = []
         weights = []
-        for idx, (name, subset, split, w) in enumerate(self.sources):
+        epochs = [0] * len(self.sources)
+
+        def _open(idx: int, epoch: int):
+            name, subset, split, _ = self.sources[idx]
             ds = load_dataset(name, subset, split=split, streaming=True)
             if self.shuffle_buffer > 0:
-                ds = ds.shuffle(seed=self.seed + worker_offset + idx, buffer_size=self.shuffle_buffer)
-            streams.append(iter(ds))
+                ds = ds.shuffle(seed=self.seed + worker_offset + idx + epoch * 7919, buffer_size=self.shuffle_buffer)
+            return iter(ds)
+
+        for idx, (_, _, _, w) in enumerate(self.sources):
+            streams.append(_open(idx, 0))
             weights.append(w)
 
         id_buf: List[int] = []
         lbl_buf: List[int] = []
 
-        while streams:
-            chosen = rng.choices(range(len(streams)), weights=weights, k=1)[0]
-            try:
-                row = next(streams[chosen])
-            except StopIteration:
-                streams.pop(chosen)
-                weights.pop(chosen)
-                continue
+        while True:
+            if self.identity_prob > 0.0 and rng.random() < self.identity_prob:
+                msgs = list(rng.choice(CINLM_IDENTITY_EXAMPLES))
+            else:
+                chosen = rng.choices(range(len(streams)), weights=weights, k=1)[0]
+                try:
+                    row = next(streams[chosen])
+                except StopIteration:
+                    # Cycle smaller splits seamlessly so mixture weights stay constant throughout SFT
+                    epochs[chosen] += 1
+                    streams[chosen] = _open(chosen, epochs[chosen])
+                    continue
 
-            msgs = normalize_sft_row(row)
-            if not msgs:
-                continue
+                msgs = normalize_sft_row(row)
+                if not msgs:
+                    continue
 
             ids, lbls = encode_sft_conversation(msgs, encode_fn=encode_fn, max_seq_len=self.seq_len)
             if not any(l != -100 for l in lbls):
@@ -342,6 +435,5 @@ class PackedSFTStreamDataset(IterableDataset):
                 y = lbl_buf[: self.seq_len]
                 id_buf = id_buf[self.seq_len :]
                 lbl_buf = lbl_buf[self.seq_len :]
-                # Skip pathological chunks with zero supervised tokens
                 if any(t != -100 for t in y[1:]):
                     yield torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)
