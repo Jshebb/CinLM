@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -104,8 +105,10 @@ def main() -> None:
     parser.add_argument("--grad-checkpoint", action="store_true", help="Enable per-layer gradient checkpointing to save VRAM")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--save-every", type=int, default=250)
+    parser.add_argument("--keep-checkpoints", type=int, default=2, help="Max numbered checkpoints to keep (saves Drive space)")
     parser.add_argument("--out-dir", default="runs/cinlm_run")
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--auto-resume", action="store_true", help="Automatically resume from <out-dir>/ckpt_latest.pt if it exists")
     args = parser.parse_args()
 
     set_seed(args.seed)
@@ -156,13 +159,24 @@ def main() -> None:
     start_step = 0
     tokens_seen = 0
 
-    if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    log_path = out_dir / "train_log.jsonl"
+    (out_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2), encoding="utf-8")
+
+    resume_path: Optional[Path] = Path(args.resume) if args.resume else None
+    if resume_path is None and args.auto_resume:
+        latest = out_dir / "ckpt_latest.pt"
+        if latest.exists():
+            resume_path = latest
+
+    if resume_path is not None and resume_path.exists():
+        ckpt = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
         start_step = int(ckpt["step"]) + 1
         tokens_seen = int(ckpt["tokens_seen"])
-        print(f"[CinLM] Resumed from {args.resume} at step {start_step} ({tokens_seen:,} tokens)")
+        print(f"[CinLM] Resumed from {resume_path} at step {start_step} ({tokens_seen:,} tokens)")
 
     enable_compile = args.compile and device.type == "cuda" and cc_major >= 8
     run_model = torch.compile(model) if enable_compile else model
@@ -170,14 +184,10 @@ def main() -> None:
     data_iter: Optional[object] = None
     if not args.synthetic:
         assert args.tokenizer is not None, "Provide --tokenizer path or pass --synthetic"
-        ds = PackedTokenStreamDataset(args.tokenizer, seq_len=seq_len, seed=args.seed)
+        # Offset shuffle seed on resume so streamed documents don't repeat from scratch
+        ds = PackedTokenStreamDataset(args.tokenizer, seq_len=seq_len, seed=args.seed + start_step)
         loader = DataLoader(ds, batch_size=args.batch_size)
         data_iter = iter(loader)
-
-    out_dir = Path(args.out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    log_path = out_dir / "train_log.jsonl"
-    (out_dir / "config.json").write_text(json.dumps(asdict(cfg), indent=2), encoding="utf-8")
 
     run_model.train()
     tokens_per_step = args.batch_size * args.grad_accum * seq_len
@@ -230,18 +240,30 @@ def main() -> None:
             t0 = time.perf_counter()
 
         if (step + 1) % args.save_every == 0 or (step + 1) == args.max_steps:
+            payload = {
+                "config": asdict(cfg),
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "step": step,
+                "tokens_seen": tokens_seen,
+            }
+            # Atomic write to ckpt_latest.pt so a mid-save Colab disconnect never corrupts it
+            latest_tmp = out_dir / "ckpt_latest.pt.tmp"
+            latest_path = out_dir / "ckpt_latest.pt"
+            torch.save(payload, latest_tmp)
+            os.replace(latest_tmp, latest_path)
+
+            # Also keep a rotated numbered snapshot (e.g., last 2) without filling Google Drive
             ckpt_path = out_dir / f"ckpt_step_{step + 1}.pt"
-            torch.save(
-                {
-                    "config": asdict(cfg),
-                    "model": model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "step": step,
-                    "tokens_seen": tokens_seen,
-                },
-                ckpt_path,
-            )
-            print(f"[CinLM] Saved checkpoint: {ckpt_path}")
+            torch.save(payload, ckpt_path)
+            if args.keep_checkpoints > 0:
+                numbered = sorted(
+                    out_dir.glob("ckpt_step_*.pt"),
+                    key=lambda p: int(p.stem.split("_")[-1]),
+                )
+                for old in numbered[: -args.keep_checkpoints]:
+                    old.unlink(missing_ok=True)
+            print(f"[CinLM] Saved checkpoint: {ckpt_path} (+ atomic ckpt_latest.pt)")
 
 
 if __name__ == "__main__":
