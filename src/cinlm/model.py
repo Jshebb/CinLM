@@ -316,6 +316,8 @@ class CinLM(nn.Module):
         max_new_tokens: int = 64,
         temperature: float = 0.8,
         top_k: int = 40,
+        top_p: float = 1.0,
+        repetition_penalty: float = 1.0,
         eos_token_id: Optional[int] = None,
     ) -> torch.Tensor:
         """Autoregressive generation using exact hybrid KV + Engram cache."""
@@ -324,19 +326,39 @@ class CinLM(nn.Module):
         cache = out["cache"]
         logits = out["logits"][:, -1, :]
         generated = [input_ids]
+        seen_ids = input_ids.clone()
 
         for _ in range(max_new_tokens):
+            step_logits = logits
+            if repetition_penalty != 1.0:
+                step_logits = step_logits.clone()
+                for b in range(step_logits.size(0)):
+                    uniq = torch.unique(seen_ids[b])
+                    scores = step_logits[b, uniq]
+                    step_logits[b, uniq] = torch.where(
+                        scores > 0, scores / repetition_penalty, scores * repetition_penalty
+                    )
+
             if temperature <= 0.0:
-                next_tok = torch.argmax(logits, dim=-1, keepdim=True)
+                next_tok = torch.argmax(step_logits, dim=-1, keepdim=True)
             else:
-                scaled = logits / temperature
+                scaled = step_logits / temperature
                 if top_k > 0:
                     v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
                     scaled = scaled.masked_fill(scaled < v[:, [-1]], float("-inf"))
+                if 0.0 < top_p < 1.0:
+                    sorted_logits, sorted_idx = torch.sort(scaled, descending=True, dim=-1)
+                    cum_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    remove = cum_probs > top_p
+                    remove[..., 1:] = remove[..., :-1].clone()
+                    remove[..., 0] = False
+                    sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
+                    scaled = torch.full_like(scaled, float("-inf")).scatter(-1, sorted_idx, sorted_logits)
                 probs = F.softmax(scaled, dim=-1)
                 next_tok = torch.multinomial(probs, num_samples=1)
 
             generated.append(next_tok)
+            seen_ids = torch.cat([seen_ids, next_tok], dim=1)
             if eos_token_id is not None and (next_tok == eos_token_id).all():
                 break
             if cache.seq_len >= self.config.max_seq_len:
