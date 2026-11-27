@@ -186,3 +186,32 @@ def test_smoke_backward_pass() -> None:
     out_ckpt["loss"].backward()
     grads_ckpt = sum(1 for p in model.parameters() if p.grad is not None and p.grad.abs().sum() > 0)
     assert grads_ckpt == grads_present
+
+
+def test_sft_assistant_only_loss_masking() -> None:
+    """Verify system & user tokens are masked (-100) while assistant reply + <|im_end|> are supervised."""
+    from cinlm.data import encode_sft_conversation, normalize_sft_row
+
+    # Toy deterministic word/char tokenizer for unit testing without external files
+    vocab = {}
+
+    def fake_encode(text: str) -> list[int]:
+        out = []
+        for ch in text:
+            if ch not in vocab:
+                vocab[ch] = len(vocab) + 1
+            out.append(vocab[ch])
+        return out
+
+    row = {"instruction": "Qual a capital do Brasil?", "output": "Brasília."}
+    msgs = normalize_sft_row(row)
+    assert msgs is not None and len(msgs) == 2
+
+    ids, labels = encode_sft_conversation(msgs, encode_fn=fake_encode, max_seq_len=512)
+    assert len(ids) == len(labels)
+    # System + user prefix must be strictly masked
+    assistant_body = fake_encode("Brasília.<|im_end|>\n")
+    n_body = len(assistant_body)
+    assert all(l == -100 for l in labels[:-n_body])
+    assert labels[-n_body:] == assistant_body
+    assert ids[-n_body:] == assistant_body

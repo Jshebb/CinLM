@@ -176,3 +176,154 @@ def format_chat_example(
         role_tag = "<|user|>" if role == "user" else "<|assistant|>"
         parts.append(f"<|im_start|>{role_tag}\n{content}<|im_end|>\n")
     return "".join(parts)
+
+
+def encode_sft_conversation(
+    messages: List[Dict[str, str]],
+    encode_fn,
+    max_seq_len: int,
+    system_prompt: str = "Você é o CinLM, um assistente útil, claro e direto em português do Brasil.",
+) -> Tuple[List[int], List[int]]:
+    """Tokenize a multi-turn conversation and mask non-assistant tokens with -100.
+
+    Only assistant content tokens and their closing `<|im_end|>` contribute to SFT loss.
+    `encode_fn` maps a string -> List[int].
+    """
+    input_ids: List[int] = []
+    labels: List[int] = []
+
+    has_system = any(m.get("role") == "system" for m in messages)
+    if not has_system and system_prompt:
+        sys_ids = encode_fn(f"<|im_start|><|system|>\n{system_prompt}<|im_end|>\n")
+        input_ids.extend(sys_ids)
+        labels.extend([-100] * len(sys_ids))
+
+    for msg in messages:
+        role = str(msg.get("role", "")).strip().lower()
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+        if role == "system":
+            seg = encode_fn(f"<|im_start|><|system|>\n{content}<|im_end|>\n")
+            input_ids.extend(seg)
+            labels.extend([-100] * len(seg))
+        elif role in ("user", "human"):
+            seg = encode_fn(f"<|im_start|><|user|>\n{content}<|im_end|>\n")
+            input_ids.extend(seg)
+            labels.extend([-100] * len(seg))
+        elif role in ("assistant", "gpt", "model"):
+            header = encode_fn("<|im_start|><|assistant|>\n")
+            body = encode_fn(f"{content}<|im_end|>\n")
+            input_ids.extend(header)
+            labels.extend([-100] * len(header))
+            input_ids.extend(body)
+            labels.extend(body)
+
+    if len(input_ids) > max_seq_len:
+        input_ids = input_ids[:max_seq_len]
+        labels = labels[:max_seq_len]
+
+    return input_ids, labels
+
+
+def normalize_sft_row(row: Dict) -> Optional[List[Dict[str, str]]]:
+    """Normalize rows from GigaVerbo-v2-SFT (`messages`) or Canarim (`instruction`/`context`/`output`)."""
+    if "messages" in row and isinstance(row["messages"], list):
+        msgs = [
+            {"role": str(m.get("role", "")), "content": str(m.get("content", ""))}
+            for m in row["messages"]
+            if isinstance(m, dict) and m.get("content")
+        ]
+        if any(m["role"] == "assistant" for m in msgs):
+            return msgs
+        return None
+
+    if "instruction" in row and "output" in row:
+        instr = str(row.get("instruction") or "").strip()
+        ctx = str(row.get("context") or row.get("input") or "").strip()
+        out = str(row.get("output") or "").strip()
+        if not instr or not out:
+            return None
+        user_msg = f"{instr}\n\nContexto:\n{ctx}" if ctx else instr
+        return [
+            {"role": "user", "content": user_msg},
+            {"role": "assistant", "content": out},
+        ]
+
+    return None
+
+
+class PackedSFTStreamDataset(IterableDataset):
+    """Streaming PT-BR SFT dataset mixing GigaVerbo-v2-SFT + Canarim-Instruct-PTBR
+    with strict assistant-only loss masking and packing into `seq_len` chunks.
+    """
+
+    def __init__(
+        self,
+        tokenizer_path: str | Path,
+        seq_len: int = 2048,
+        seed: int = 42,
+        shuffle_buffer: int = 1000,
+    ) -> None:
+        super().__init__()
+        self.tokenizer_path = str(tokenizer_path)
+        self.seq_len = seq_len
+        self.seed = seed
+        self.shuffle_buffer = shuffle_buffer
+        self.sources = (
+            ("Polygl0t/gigaverbo-v2-sft", None, "train", 0.70),
+            ("dominguesm/Canarim-Instruct-PTBR-Dataset", None, "train", 0.30),
+        )
+
+    def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        import random
+        from datasets import load_dataset
+        from tokenizers import Tokenizer
+
+        worker_info = torch.utils.data.get_worker_info()
+        worker_offset = worker_info.id * 1009 if worker_info is not None else 0
+
+        tok = Tokenizer.from_file(self.tokenizer_path)
+        encode_fn = lambda s: tok.encode(s).ids
+
+        rng = random.Random(self.seed + worker_offset)
+        streams = []
+        weights = []
+        for idx, (name, subset, split, w) in enumerate(self.sources):
+            ds = load_dataset(name, subset, split=split, streaming=True)
+            if self.shuffle_buffer > 0:
+                ds = ds.shuffle(seed=self.seed + worker_offset + idx, buffer_size=self.shuffle_buffer)
+            streams.append(iter(ds))
+            weights.append(w)
+
+        id_buf: List[int] = []
+        lbl_buf: List[int] = []
+
+        while streams:
+            chosen = rng.choices(range(len(streams)), weights=weights, k=1)[0]
+            try:
+                row = next(streams[chosen])
+            except StopIteration:
+                streams.pop(chosen)
+                weights.pop(chosen)
+                continue
+
+            msgs = normalize_sft_row(row)
+            if not msgs:
+                continue
+
+            ids, lbls = encode_sft_conversation(msgs, encode_fn=encode_fn, max_seq_len=self.seq_len)
+            if not any(l != -100 for l in lbls):
+                continue
+
+            id_buf.extend(ids)
+            lbl_buf.extend(lbls)
+
+            while len(id_buf) >= self.seq_len:
+                x = id_buf[: self.seq_len]
+                y = lbl_buf[: self.seq_len]
+                id_buf = id_buf[self.seq_len :]
+                lbl_buf = lbl_buf[self.seq_len :]
+                # Skip pathological chunks with zero supervised tokens
+                if any(t != -100 for t in y[1:]):
+                    yield torch.tensor(x, dtype=torch.long), torch.tensor(y, dtype=torch.long)

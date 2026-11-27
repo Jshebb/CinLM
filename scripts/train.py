@@ -270,6 +270,7 @@ def main() -> None:
                 for old in numbered[: -args.keep_checkpoints]:
                     old.unlink(missing_ok=True)
             print(f"[CinLM] Saved checkpoint: {ckpt_path} (+ atomic ckpt_latest.pt)")
+            t0 = time.perf_counter()
 
 
 if __name__ == "__main__":
