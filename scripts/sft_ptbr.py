@@ -122,7 +122,7 @@ def main() -> None:
     resuming_sft = args.auto_resume and sft_latest.exists()
     load_path = sft_latest if resuming_sft else Path(args.base_checkpoint)
 
-    ckpt = torch.load(load_path, map_location=device, weights_only=False)
+    ckpt = torch.load(load_path, map_location="cpu", weights_only=False)
     cfg_dict = dict(ckpt["config"])
     for k in ("engram_layers", "engram_ngram_orders", "engram_table_sizes"):
         if k in cfg_dict and isinstance(cfg_dict[k], list):
@@ -148,6 +148,9 @@ def main() -> None:
             f"[CinLM SFT] Initialized from pretrained {load_path} "
             f"(pretrain step={int(ckpt.get('step', 0)) + 1}, pretrain tokens={int(ckpt.get('tokens_seen', 0)):,})"
         )
+    del ckpt
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
     ds = PackedSFTStreamDataset(
         args.tokenizer,

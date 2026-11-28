@@ -15,6 +15,7 @@ Features:
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import math
 import os
@@ -181,13 +182,13 @@ def main() -> None:
         if latest.exists():
             resume_path = latest
 
-    # Resolve config: prefer checkpoint config when resuming or branching via --init-from
+    # Resolve config: load checkpoint on CPU first to avoid doubling peak GPU VRAM on 24GB GPUs (L4)
     init_ckpt = None
     if resume_path is not None and resume_path.exists():
-        init_ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        init_ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
         cfg = _cfg_from_dict(init_ckpt["config"])
     elif args.init_from:
-        init_ckpt = torch.load(args.init_from, map_location=device, weights_only=False)
+        init_ckpt = torch.load(args.init_from, map_location="cpu", weights_only=False)
         cfg = _cfg_from_dict(init_ckpt["config"])
         # Apply requested branch architecture extensions (function-preserving at step 0)
         cfg.loop_core_steps = args.loop_core_steps
@@ -259,6 +260,12 @@ def main() -> None:
             f"[CinLM] Branched from {args.init_from} (base_tokens={base_tokens_seen:,}, "
             f"new_extension_keys={len(load_res.missing_keys)})"
         )
+
+    if init_ckpt is not None:
+        del init_ckpt
+        gc.collect()
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
     print(
         f"[CinLM] model={cfg.name} opt={args.optimizer} sched={args.schedule} "
