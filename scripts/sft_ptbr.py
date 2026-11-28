@@ -84,7 +84,18 @@ def main() -> None:
     parser.add_argument(
         "--include-canarim",
         action="store_true",
-        help="Mix 30% Canarim-Instruct-PTBR (CC-BY-NC-4.0). Off by default to keep 100% Apache 2.0.",
+        help="Mix 30%% Canarim-Instruct-PTBR (CC-BY-NC-4.0). Off by default to keep 100%% Apache 2.0.",
+    )
+    parser.add_argument(
+        "--no-hybrid-thinking",
+        action="store_true",
+        help="Disable Qwen3-style Hybrid Thinking directives (Modo: pensar. vs Modo: direto.)",
+    )
+    parser.add_argument(
+        "--max-think-chars",
+        type=int,
+        default=1200,
+        help="Max characters inside <think>...</think> (keeps 1B reasoning concise & focused)",
     )
     parser.add_argument("--out-dir", default="runs/cinlm_sft_ptbr")
     args = parser.parse_args()
@@ -143,6 +154,8 @@ def main() -> None:
         seq_len=args.seq_len,
         seed=args.seed + start_step,
         include_canarim=args.include_canarim,
+        hybrid_thinking=not args.no_hybrid_thinking,
+        max_think_chars=args.max_think_chars,
     )
     n_workers = min(4, max(2, (os.cpu_count() or 2) // 2)) if device.type == "cuda" else 0
     loader_kwargs = (

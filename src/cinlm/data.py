@@ -245,15 +245,65 @@ class PackedTokenStreamDataset(IterableDataset):
 def format_chat_example(
     messages: List[Dict[str, str]],
     system_prompt: str = "Você é o CinLM, um assistente útil, claro e direto em português do Brasil.",
+    mode: str = "auto",
 ) -> str:
-    """Format multi-turn PT-BR SFT conversation using CinLM chat tags."""
-    parts = [f"<|im_start|><|system|>\n{system_prompt}<|im_end|>\n"]
+    """Format multi-turn PT-BR SFT conversation using CinLM chat tags.
+
+    `mode`:
+      - "auto": use `system_prompt` verbatim
+      - "direct": append "Modo: direto." (fast answer without <think>)
+      - "think": append "Modo: pensar." (structured short <think>...</think> before answering)
+    """
+    sys_txt = system_prompt.strip()
+    if mode == "direct" and "Modo:" not in sys_txt:
+        sys_txt = f"{sys_txt} Modo: direto."
+    elif mode == "think" and "Modo:" not in sys_txt:
+        sys_txt = f"{sys_txt} Modo: pensar."
+    parts = [f"<|im_start|><|system|>\n{sys_txt}<|im_end|>\n"]
     for msg in messages:
         role = msg["role"]
         content = msg["content"].strip()
         role_tag = "<|user|>" if role == "user" else "<|assistant|>"
         parts.append(f"<|im_start|>{role_tag}\n{content}<|im_end|>\n")
     return "".join(parts)
+
+
+def apply_hybrid_thinking_mode(
+    messages: List[Dict[str, str]],
+    *,
+    max_think_chars: int = 1200,
+    default_system: str = "Você é o CinLM, um assistente útil, claro e direto em português do Brasil.",
+) -> Optional[List[Dict[str, str]]]:
+    """Tag SFT conversations with explicit Qwen3-style Hybrid Thinking mode directives.
+
+    - Examples containing `<think>...</think>` get `Modo: pensar.` in their system prompt.
+      If the `<think>` block exceeds `max_think_chars`, returns None so a 1B model trains on
+      concise, structured reasoning rather than long rambling monologues.
+    - Non-thinking examples get `Modo: direto.` in their system prompt.
+    """
+    has_think = False
+    for m in messages:
+        if m.get("role") in ("assistant", "gpt", "model"):
+            c = str(m.get("content", ""))
+            if "<think>" in c and "</think>" in c:
+                has_think = True
+                start = c.find("<think>") + len("<think>")
+                end = c.find("</think>", start)
+                if end < start or (end - start) > max_think_chars:
+                    return None
+                # Require non-empty final answer after </think>
+                if not c[end + len("</think>") :].strip():
+                    return None
+
+    directive = "Modo: pensar." if has_think else "Modo: direto."
+    out = [dict(m) for m in messages]
+    if out and out[0].get("role") == "system":
+        base_sys = out[0]["content"].strip()
+        if "Modo:" not in base_sys:
+            out[0]["content"] = f"{base_sys} {directive}"
+    else:
+        out.insert(0, {"role": "system", "content": f"{default_system} {directive}"})
+    return out
 
 
 def encode_sft_conversation(
@@ -347,6 +397,8 @@ class PackedSFTStreamDataset(IterableDataset):
         shuffle_buffer: int = 1000,
         include_canarim: bool = False,
         identity_prob: float = 0.025,
+        hybrid_thinking: bool = True,
+        max_think_chars: int = 1200,
     ) -> None:
         super().__init__()
         self.tokenizer_path = str(tokenizer_path)
@@ -354,24 +406,26 @@ class PackedSFTStreamDataset(IterableDataset):
         self.seed = seed
         self.shuffle_buffer = shuffle_buffer
         self.identity_prob = identity_prob
+        self.hybrid_thinking = hybrid_thinking
+        self.max_think_chars = max_think_chars
         if include_canarim:
             self.sources = (
-                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.30),
+                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.28),
                 ("Polygl0t/gigaverbo-v2-sft", "retrieval", "train", 0.20),
-                ("Polygl0t/gigaverbo-v2-sft", "summarization", "train", 0.08),
-                ("Polygl0t/gigaverbo-v2-sft", "reasoning", "train", 0.07),
-                ("Polygl0t/gigaverbo-v2-sft", "math_cot", "train", 0.05),
+                ("Polygl0t/gigaverbo-v2-sft", "reasoning", "train", 0.12),
+                ("Polygl0t/gigaverbo-v2-sft", "summarization", "train", 0.06),
+                ("Polygl0t/gigaverbo-v2-sft", "math_cot", "train", 0.04),
                 ("dominguesm/Canarim-Instruct-PTBR-Dataset", None, "train", 0.30),
             )
         else:
-            # 100% Apache 2.0 multi-skill PT-BR SFT mix
+            # 100% Apache 2.0 multi-skill PT-BR SFT mix (with 16% native <think> reasoning)
             self.sources = (
-                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.38),
-                ("Polygl0t/gigaverbo-v2-sft", "retrieval", "train", 0.24),
-                ("Polygl0t/gigaverbo-v2-sft", "summarization", "train", 0.10),
-                ("Polygl0t/gigaverbo-v2-sft", "reasoning", "train", 0.10),
-                ("Polygl0t/gigaverbo-v2-sft", "math_cot", "train", 0.05),
+                ("Polygl0t/gigaverbo-v2-sft", "general", "train", 0.35),
+                ("Polygl0t/gigaverbo-v2-sft", "retrieval", "train", 0.23),
+                ("Polygl0t/gigaverbo-v2-sft", "reasoning", "train", 0.16),
+                ("Polygl0t/gigaverbo-v2-sft", "summarization", "train", 0.09),
                 ("Polygl0t/gigaverbo-v2-sft", "code", "train", 0.05),
+                ("Polygl0t/gigaverbo-v2-sft", "math_cot", "train", 0.04),
                 ("Polygl0t/gigaverbo-v2-sft", "system_prompts", "train", 0.04),
                 ("Polygl0t/gigaverbo-v2-sft", "rewriting", "train", 0.04),
             )
@@ -420,6 +474,11 @@ class PackedSFTStreamDataset(IterableDataset):
                     continue
 
                 msgs = normalize_sft_row(row)
+                if not msgs:
+                    continue
+
+            if self.hybrid_thinking:
+                msgs = apply_hybrid_thinking_mode(msgs, max_think_chars=self.max_think_chars)
                 if not msgs:
                     continue
 

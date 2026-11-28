@@ -84,6 +84,7 @@ class SparseReLU2MoE(nn.Module):
         x: torch.Tensor,
         ablate_experts: Optional[Sequence[int]] = None,
         ablate_shared: bool = False,
+        router_bias_patch: Optional[Dict[int, float]] = None,
         return_telemetry: bool = False,
     ) -> Tuple[torch.Tensor, Optional[Dict[str, torch.Tensor]]]:
         bsz, seq_len, d_model = x.shape
@@ -102,10 +103,16 @@ class SparseReLU2MoE(nn.Module):
                 else None
             )
 
-        # 2. Router scores (sigmoid affinity + dynamic bias ONLY for top-k selection)
+        # 2. Router scores (sigmoid affinity + dynamic bias + optional programmable steering patch)
         router_logits = self.router(x_flat).float()  # (N, E)
         affinities = torch.sigmoid(router_logits)  # (N, E)
         selection_scores = affinities + self.expert_bias.unsqueeze(0)
+        if router_bias_patch:
+            patch_vec = torch.zeros(self.n_experts, device=x.device, dtype=torch.float32)
+            for exp_id, delta in router_bias_patch.items():
+                if 0 <= int(exp_id) < self.n_experts:
+                    patch_vec[int(exp_id)] = float(delta)
+            selection_scores = selection_scores + patch_vec.unsqueeze(0)
 
         _, topk_idx = torch.topk(selection_scores, k=self.top_k, dim=-1)  # (N, K)
         # Gather unbiased affinities and normalize over top-k

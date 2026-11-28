@@ -23,6 +23,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=40)
     parser.add_argument("--top-p", type=float, default=0.9)
     parser.add_argument("--repetition-penalty", type=float, default=1.18)
+    parser.add_argument("--mode", default="direct", choices=["direct", "think", "auto"])
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -52,7 +53,7 @@ def main() -> None:
             continue
 
         history.append({"role": "user", "content": user_text})
-        prompt = format_chat_example(history) + "<|im_start|><|assistant|>\n"
+        prompt = format_chat_example(history, mode=args.mode) + "<|im_start|><|assistant|>\n"
         prompt_ids = tok.encode(prompt).ids[-(model.config.max_seq_len - args.max_new_tokens) :]
         inp = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 

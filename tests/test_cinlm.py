@@ -391,3 +391,60 @@ def test_full_1b_a200m_preset_and_simpo_loss() -> None:
         opt.step()
     assert m_last["reward_margin"] > m0["reward_margin"]
     assert m_last["pref_acc"] == 1.0
+
+
+def test_hybrid_thinking_mode_and_programmable_router_steering() -> None:
+    """Verify Qwen3-style Hybrid Thinking SFT directives and programmable MoE router steering."""
+    from cinlm.data import apply_hybrid_thinking_mode
+
+    # 1. Direct example -> tagged Modo: direto.
+    direct = apply_hybrid_thinking_mode(
+        [{"role": "user", "content": "Qual a capital?"}, {"role": "assistant", "content": "Brasília."}]
+    )
+    assert direct is not None and direct[0]["role"] == "system"
+    assert "Modo: direto." in direct[0]["content"]
+
+    # 2. Concise <think> example -> tagged Modo: pensar.
+    short_think = apply_hybrid_thinking_mode(
+        [
+            {"role": "user", "content": "Quanto é 2+2?"},
+            {"role": "assistant", "content": "<think>\n2 + 2 = 4.\n</think>\n\n4."},
+        ],
+        max_think_chars=100,
+    )
+    assert short_think is not None and "Modo: pensar." in short_think[0]["content"]
+
+    # 3. Overly long <think> monologue -> filtered out to keep 1B reasoning concise
+    long_think = apply_hybrid_thinking_mode(
+        [
+            {"role": "user", "content": "Explique"},
+            {"role": "assistant", "content": f"<think>\n{'passo ' * 100}\n</think>\n\nOk."},
+        ],
+        max_think_chars=100,
+    )
+    assert long_think is None
+
+    # 4. Programmable Router Steering (Neural Skill Patch) deterministically steers expert selection
+    torch.manual_seed(14)
+    cfg = get_preset_config("smoke")
+    model = CinLM(cfg).eval()
+    x = torch.randint(0, cfg.vocab_size, (1, 12))
+
+    # Boost expert 3 strongly on layer 0 via declarative InterventionSpec
+    patch = InterventionSpec(router_bias_patch={0: {3: 5.0}})
+    with torch.no_grad():
+        out = model(x, intervention=patch, capture_telemetry=True)
+    topk_l0 = out["telemetry"]["layers"][0]["moe_telemetry"]["topk_experts"]  # (1, 12, 2)
+    # Expert 3 must be selected on every single token in layer 0
+    assert (topk_l0 == 3).any(dim=-1).all().item()
+
+    # Dynamic think_intervention during generate() runs cleanly
+    gen = model.generate(
+        x[:, :6],
+        max_new_tokens=6,
+        temperature=0.0,
+        think_intervention=patch,
+        think_open_ids=[int(x[0, 5].item())],
+        think_close_ids=[999],
+    )
+    assert gen.shape == (1, 12)

@@ -27,6 +27,8 @@ class InterventionSpec:
     ablate_experts: Dict[int, List[int]] = field(default_factory=dict)
     # Set of layer_idx where the shared expert is zeroed out
     ablate_shared_layers: List[int] = field(default_factory=list)
+    # Programmable Router Steering (Neural Skill Patch): layer_idx -> {expert_id: delta_bias}
+    router_bias_patch: Dict[int, Dict[int, float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -133,10 +135,16 @@ class CinLMBlock(nn.Module):
                 if intervention is not None
                 else False
             )
+            router_patch = (
+                intervention.router_bias_patch.get(self.layer_idx)
+                if intervention is not None
+                else None
+            )
             ffn_out, moe_tel = self.ffn(
                 self.ffn_norm(x),
                 ablate_experts=ablate_experts,
                 ablate_shared=ablate_shared,
+                router_bias_patch=router_patch,
                 return_telemetry=capture_telemetry,
             )
             if capture_telemetry and layer_tel is not None:
@@ -449,10 +457,33 @@ class CinLM(nn.Module):
         repetition_penalty: float = 1.0,
         eos_token_id: Optional[int] = None,
         num_loops: Optional[int] = None,
+        intervention: Optional[InterventionSpec] = None,
+        think_intervention: Optional[InterventionSpec] = None,
+        think_open_ids: Optional[Sequence[int]] = None,
+        think_close_ids: Optional[Sequence[int]] = None,
     ) -> torch.Tensor:
-        """Autoregressive generation using exact hybrid KV + Engram cache."""
+        """Autoregressive generation using exact hybrid KV + Engram cache.
+
+        Supports declarative programmable routing via `intervention` (always active) and
+        `think_intervention` (dynamically activated ONLY while generating inside
+        `<think>...</think>` spans matched by `think_open_ids` / `think_close_ids`).
+        """
         self.eval()
-        out = self.forward(input_ids, use_cache=True, num_loops=num_loops)
+        open_seq = list(think_open_ids) if think_open_ids else []
+        close_seq = list(think_close_ids) if think_close_ids else []
+
+        def _ends_with(seq_tensor: torch.Tensor, pattern: List[int]) -> bool:
+            if not pattern or seq_tensor.size(1) < len(pattern):
+                return False
+            tail = seq_tensor[0, -len(pattern) :].tolist()
+            return tail == pattern
+
+        in_think = False
+        if open_seq and _ends_with(input_ids, open_seq):
+            in_think = True
+
+        active_int = think_intervention if (in_think and think_intervention is not None) else intervention
+        out = self.forward(input_ids, use_cache=True, num_loops=num_loops, intervention=active_int)
         cache = out["cache"]
         logits = out["logits"][:, -1, :]
         generated = [input_ids]
@@ -494,7 +525,15 @@ class CinLM(nn.Module):
             if cache.seq_len >= self.config.max_seq_len:
                 break
 
-            out = self.forward(next_tok, cache=cache, use_cache=True, num_loops=num_loops)
+            if open_seq and not in_think and _ends_with(seen_ids, open_seq):
+                in_think = True
+            elif close_seq and in_think and _ends_with(seen_ids, close_seq):
+                in_think = False
+
+            active_int = think_intervention if (in_think and think_intervention is not None) else intervention
+            out = self.forward(
+                next_tok, cache=cache, use_cache=True, num_loops=num_loops, intervention=active_int
+            )
             cache = out["cache"]
             logits = out["logits"][:, -1, :]
 
